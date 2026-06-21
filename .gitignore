@@ -1,0 +1,43 @@
+# 建置產物
+*.exe
+build/
+dist/
+__pycache__/
+*.spec.bak
+
+# 翻譯快取與執行期資料（大檔、會持續變動）
+translation_cache*.json*
+translation_memory_pool.json*
+translation_update_index.json
+restore_class_contamination_report.json
+Failed Items/
+crash_analysis/
+
+# 含 API 金鑰的設定檔（Base64 可還原，不可進版控）
+app_config.json
+app_config.*.json
+
+# 備份與暫存
+*.backup-*
+*.backup_*
+*.tmp
+*.bak
+*.bak_*
+*.log
+*.zip
+*.sqlite3
+*.shelve.*
+*.dat
+*.dir
+dictionary_zh_tw.json
+extracted_exe_icon.png
+apply_progress_layout_update.ps1
+app_icon_source.png
+
+# 工具
+.claude/
+
+# 直跑管線的輸出產物（1.7GB，含套用前備份，保留於磁碟即可）
+_client_out/
+runtime_backups/
+exe_backups/
