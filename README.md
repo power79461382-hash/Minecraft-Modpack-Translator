@@ -4,6 +4,17 @@ Minecraft Modpack Translator 是一個面向 Minecraft 大型整合包的 Window
 
 本專案的目標不是只翻譯單一 `en_us.json`，而是盡可能處理整合包常見的多來源文字：模組語言檔、Patchouli 手冊、FTB Quests / KubeJS 任務、advancement、OpenLoader / Paxi 覆蓋資料、Origins JSON、Alex's Mobs 類型書本、Markdown / SNBT / 部分設定文字，以及低風險硬編碼 tooltip。
 
+## 直接下載 Windows EXE
+
+一般使用者不需要安裝 Python。請到 GitHub Releases 下載最新版：
+
+- 下載頁：[MinecraftTranslatorGUI.exe](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/latest)
+- 檔案名稱：`MinecraftTranslatorGUI.exe`
+- 系統需求：Windows 10/11，建議放在可寫入的資料夾中執行
+- 使用方式：下載後直接雙擊啟動，選擇整合包資料夾，按「分析檔案」後再開始翻譯
+
+第一次執行時，Windows Defender 或 SmartScreen 可能會提示未簽章程式。此 EXE 是由本專案源碼使用 PyInstaller 打包，不包含個人 API 設定檔、翻譯快取、輸出 ZIP 或 Minecraft 模組包。
+
 ## 目前能做到什麼
 
 - 自動分析整合包根目錄、`mods/`、`config/`、`defaultconfigs/`、resource pack、OpenLoader 與 Paxi 覆蓋目錄。
