@@ -18,7 +18,12 @@ from core.batch_translation import (
     translation_fallback_order,
     translation_worker_limit,
 )
-from core.analysis_scan import is_translator_generated_dir_name, scan_single_jar
+from core.analysis_scan import (
+    is_translator_generated_dir_name,
+    scan_single_jar,
+    should_descend_scan_dir,
+    should_scan_translation_archive,
+)
 from core.jar_patcher import (
     generate_jar_patches,
     has_paxi,
@@ -41,11 +46,13 @@ from translation_packager import (
     is_localized_manual_resource,
     is_preferred_manual_source,
     locale_segment,
+    merge_zh_base_fallback,
     merge_structured_json_with_existing_zh,
     parse_legacy_lang_content,
     structured_json_needs_update,
     translated_fallback_paths,
     translated_lang_path,
+    translated_repair_fallback_paths,
 )
 from translator_providers import (
     BING_BATCH_SIZE,
@@ -118,6 +125,56 @@ class TranslationCacheTests(unittest.TestCase):
             finally:
                 if hasattr(cache, "close"):
                     cache.close()
+
+    def test_delete_removes_pending_update_and_persisted_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "translation_cache.json")
+            cache, _messages = load_translation_cache(
+                path, FORMAT_RE, lambda _s, t: bool(t))
+            try:
+                cache["Hello"] = "你好"
+                cache.sync()
+                cache["Hello"] = "您好"
+
+                del cache["Hello"]
+
+                self.assertNotIn("Hello", cache)
+                self.assertEqual(len(cache), 0)
+                cache.sync()
+            finally:
+                cache.close()
+
+            reopened, _messages = load_translation_cache(
+                path, FORMAT_RE, lambda _s, t: bool(t))
+            try:
+                self.assertNotIn("Hello", reopened)
+            finally:
+                reopened.close()
+
+    def test_pop_removes_pending_update_and_persisted_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "translation_cache.json")
+            cache, _messages = load_translation_cache(
+                path, FORMAT_RE, lambda _s, t: bool(t))
+            try:
+                cache["Hello"] = "你好"
+                cache.sync()
+                cache["Hello"] = "您好"
+
+                self.assertEqual(cache.pop("Hello"), "您好")
+
+                self.assertNotIn("Hello", cache)
+                self.assertEqual(len(cache), 0)
+                cache.sync()
+            finally:
+                cache.close()
+
+            reopened, _messages = load_translation_cache(
+                path, FORMAT_RE, lambda _s, t: bool(t))
+            try:
+                self.assertNotIn("Hello", reopened)
+            finally:
+                reopened.close()
 
     def test_pause_checkpoint_uses_light_save_only(self):
         class App:
@@ -248,6 +305,16 @@ class PackagerTests(unittest.TestCase):
             translated_fallback_paths("assets/example/lang/en_us.json"),
             (),
         )
+        self.assertEqual(
+            translated_repair_fallback_paths(
+                "assets/alexsmobs/book/animal_dictionary/zh_tw/capuchin_monkey.txt"),
+            ("assets/alexsmobs/book/animal_dictionary/en_us/capuchin_monkey.txt",),
+        )
+        self.assertEqual(
+            translated_repair_fallback_paths(
+                "data/example/patchouli_books/book/zh_tw/categories/root.json"),
+            ("data/example/patchouli_books/book/en_us/categories/root.json",),
+        )
 
     def test_lenient_json_loader(self):
         def clean(text):
@@ -295,6 +362,25 @@ class PackagerTests(unittest.TestCase):
         self.assertEqual(merged["name"], "寶石鑲嵌")
         self.assertEqual(merged["pages"][0]["text"], "不需要的獨特武器可以熔化。")
         self.assertEqual(merged["pages"][1]["item"], "example:gem")
+
+    def test_partial_zh_tw_base_uses_zh_cn_fallback(self):
+        zh_cn = {
+            "origin.origins-classes.warrior.name": "战士",
+            "origin.origins-classes.warrior.description": "可敬的战士们更乐意以剑与盾作战。",
+            "nested": {"title": "章节", "text": "来自简体中文的底稿。"},
+        }
+        zh_tw = {
+            "_comment": "official zh_tw placeholder",
+            "nested": {"title": "章節"},
+        }
+
+        merged = merge_zh_base_fallback(zh_cn, zh_tw)
+
+        self.assertEqual(merged["_comment"], "official zh_tw placeholder")
+        self.assertEqual(merged["origin.origins-classes.warrior.name"], "战士")
+        self.assertEqual(merged["origin.origins-classes.warrior.description"], "可敬的战士们更乐意以剑与盾作战。")
+        self.assertEqual(merged["nested"]["title"], "章節")
+        self.assertEqual(merged["nested"]["text"], "来自简体中文的底稿。")
 
 
 class BookReflowTests(unittest.TestCase):
@@ -384,6 +470,145 @@ class PatchouliJsonTranslationTests(unittest.TestCase):
 
         self.assertTrue(app.should_translate("已翻譯但還有 Frost Ward 可見文字$(p)"))
 
+    def test_untranslated_patchouli_output_detection_keeps_ids_safe(self):
+        app = object.__new__(ModTranslatorApp)
+        source = {
+            "name": "Gem Socketing",
+            "category": "apotheosis:adventure/root",
+            "pages": [
+                {
+                    "type": "patchouli:text",
+                    "text": "Unwanted Unique weapons can be smelted down.",
+                    "item": "example:gem",
+                },
+                {"type": "patchouli:spotlight", "item": "example:gem"},
+            ],
+        }
+        output = {
+            "name": "Gem Socketing",
+            "category": "apotheosis:adventure/root",
+            "pages": [
+                {
+                    "type": "patchouli:text",
+                    "text": "Unwanted Unique weapons can be smelted down.",
+                    "item": "example:gem",
+                },
+                {"type": "patchouli:spotlight", "item": "example:gem"},
+            ],
+        }
+
+        missing = set(app._collect_untranslated_visible_json_strings(
+            source, output, strict_context=True))
+
+        self.assertIn("Gem Socketing", missing)
+        self.assertIn("Unwanted Unique weapons can be smelted down.", missing)
+        self.assertNotIn("apotheosis:adventure/root", missing)
+        self.assertNotIn("patchouli:text", missing)
+        self.assertNotIn("example:gem", missing)
+
+    def test_structured_book_json_retries_untranslated_visible_fields_before_output(self):
+        app = object.__new__(ModTranslatorApp)
+        app.stop_requested = False
+        app._to_traditional = lambda value: value
+        app.log = lambda *_args, **_kwargs: None
+        translations = {}
+        final_translations = {
+            "Gem Socketing": "寶石鑲嵌",
+            "Unwanted Unique weapons can be smelted down.": "不需要的獨特武器可以熔化。",
+        }
+
+        def get_translation(text):
+            return translations.get(text, text)
+
+        def batch_translate_missing(strings, _force_chunk_size=None, _preferred_engine=None):
+            for text in strings:
+                if text in final_translations:
+                    translations[text] = final_translations[text]
+
+        app.get_translation = get_translation
+        app.batch_translate_missing = batch_translate_missing
+
+        source = {
+            "name": "Gem Socketing",
+            "category": "apotheosis:adventure/root",
+            "pages": [
+                {
+                    "type": "patchouli:text",
+                    "text": "Unwanted Unique weapons can be smelted down.",
+                    "item": "example:gem",
+                }
+            ],
+        }
+
+        def process_book_data(data, preserve=False, strict=False):
+            return app.process_json_data(data, preserve, True)
+
+        merged = merge_structured_json_with_existing_zh(
+            source, {}, process_book_data, app._to_traditional,
+            value_needs_update=ModTranslatorApp._lang_value_needs_update)
+        self.assertEqual(merged["name"], "Gem Socketing")
+        self.assertEqual(
+            merged["pages"][0]["text"],
+            "Unwanted Unique weapons can be smelted down.")
+
+        repaired = app._repair_structured_book_json_output(
+            source, {}, merged, process_book_data, "test")
+
+        self.assertEqual(repaired["name"], "寶石鑲嵌")
+        self.assertEqual(repaired["pages"][0]["text"], "不需要的獨特武器可以熔化。")
+        self.assertEqual(repaired["category"], "apotheosis:adventure/root")
+        self.assertEqual(repaired["pages"][0]["type"], "patchouli:text")
+        self.assertEqual(repaired["pages"][0]["item"], "example:gem")
+
+
+class StructuralReferenceGuardTests(unittest.TestCase):
+    def test_structural_file_references_are_not_translated(self):
+        app = object.__new__(ModTranslatorApp)
+        app.stop_requested = False
+        app._to_traditional = lambda value: value
+        app._translate_json_text_component_string = lambda value: None
+        app.get_translation = lambda value: {
+            "Build this structure.": "建造這個結構。",
+            "HouseV2.nbt": "房屋V2.nbt",
+            "prefab:schematics/HouseV2.nbt": "prefab:schematics/房屋V2.nbt",
+        }.get(value, value)
+
+        result = app.process_json_data({
+            "schematic": "HouseV2.nbt",
+            "prefab": "prefab:schematics/HouseV2.nbt",
+            "text": "Build this structure.",
+        })
+
+        self.assertEqual(result["schematic"], "HouseV2.nbt")
+        self.assertEqual(result["prefab"], "prefab:schematics/HouseV2.nbt")
+        self.assertEqual(result["text"], "建造這個結構。")
+        self.assertFalse(app.should_translate("HouseV2.nbt"))
+        self.assertEqual(app.validate_translation("HouseV2.nbt", "房屋V2.nbt"), "HouseV2.nbt")
+
+    def test_polluted_existing_structural_reference_is_repaired(self):
+        source = {"schematic": "HouseV2.nbt", "name": "Prefab House"}
+        existing = {"schematic": "房屋V2.nbt", "name": "預製房屋"}
+
+        def process(data):
+            if isinstance(data, dict):
+                return {key: process(value) for key, value in data.items()}
+            if data == "Prefab House":
+                return "預製房屋"
+            return data
+
+        merged = merge_structured_json_with_existing_zh(
+            source,
+            existing,
+            process,
+            lambda value: value,
+            value_needs_update=ModTranslatorApp._lang_value_needs_update,
+        )
+
+        self.assertTrue(ModTranslatorApp._lang_value_needs_update("HouseV2.nbt", "房屋V2.nbt"))
+        self.assertFalse(ModTranslatorApp._lang_value_needs_update("HouseV2.nbt", "HouseV2.nbt"))
+        self.assertEqual(merged["schematic"], "HouseV2.nbt")
+        self.assertEqual(merged["name"], "預製房屋")
+
 
 class AnalysisScanFilterTests(unittest.TestCase):
     def test_skips_translator_generated_overlay_and_backup_directories(self):
@@ -393,6 +618,43 @@ class AnalysisScanFilterTests(unittest.TestCase):
         self.assertTrue(is_translator_generated_dir_name("mc_modpack_translator"))
         self.assertFalse(is_translator_generated_dir_name("patchouli_books"))
         self.assertFalse(is_translator_generated_dir_name("datapacks"))
+
+    def test_archive_filter_keeps_real_mods_and_skips_runtime_caches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real_mod = os.path.join(tmp, "mods", "example.jar")
+            cache_mod = os.path.join(tmp, ".fabric", "processedMods", "example.jar")
+            root_jar = os.path.join(tmp, "Example Pack.jar")
+            library_jar = os.path.join(tmp, "libraries", "ignored.jar")
+            rp_zip = os.path.join(tmp, "resourcepacks", "ui.zip")
+            rp_jar = os.path.join(tmp, "resourcepacks", "data_pack_style.jar")
+            global_zip = os.path.join(tmp, "global_packs", "global.zip")
+            natives_jar = os.path.join(tmp, "Example Pack-natives", "native-helper.jar")
+            for path in (real_mod, cache_mod, root_jar, library_jar, rp_zip, rp_jar, global_zip, natives_jar):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as fh:
+                    fh.write(b"")
+
+            self.assertTrue(should_scan_translation_archive(tmp, real_mod))
+            self.assertTrue(should_scan_translation_archive(tmp, root_jar))
+            self.assertTrue(should_scan_translation_archive(tmp, rp_zip))
+            self.assertTrue(should_scan_translation_archive(tmp, rp_jar))
+            self.assertTrue(should_scan_translation_archive(tmp, global_zip))
+            self.assertFalse(should_scan_translation_archive(tmp, cache_mod))
+            self.assertFalse(should_scan_translation_archive(tmp, library_jar))
+            self.assertFalse(should_scan_translation_archive(tmp, natives_jar))
+
+    def test_directory_filter_skips_runtime_caches_but_keeps_pack_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(should_descend_scan_dir(tmp, tmp, ".fabric"))
+            self.assertFalse(should_descend_scan_dir(tmp, tmp, ".mixin.out"))
+            self.assertFalse(should_descend_scan_dir(tmp, tmp, "libraries"))
+            self.assertFalse(should_descend_scan_dir(tmp, tmp, "Example Pack-natives"))
+            self.assertTrue(should_descend_scan_dir(tmp, tmp, "assets"))
+
+            assets_dir = os.path.join(tmp, "assets")
+            os.makedirs(assets_dir)
+            self.assertFalse(should_descend_scan_dir(tmp, assets_dir, "objects"))
+            self.assertTrue(should_descend_scan_dir(tmp, assets_dir, "examplemod"))
 
     def test_patchouli_scan_prefers_en_us_over_zh_cn_for_same_book(self):
         class Var:
@@ -459,6 +721,78 @@ class AnalysisScanFilterTests(unittest.TestCase):
         self.assertIn(jar_path, app.analyzed_jars)
         self.assertIn(en_path, app.analyzed_jars[jar_path])
         self.assertNotIn(zh_cn_path, app.analyzed_jars[jar_path])
+
+    def test_book_txt_scan_keeps_en_us_when_zh_cn_exists(self):
+        class Var:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        class NullLock:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        class FakeScanApp:
+            def __init__(self):
+                self.process_mode_var = Var("append")
+                self.scope_mod_lang_var = Var(False)
+                self.scope_books_var = Var(True)
+                self.scope_quests_var = Var(False)
+                self._scan_process_mode = "append"
+                self._scan_scope_mod_lang = False
+                self._scan_scope_books = True
+                self._scan_scope_quests = False
+                self._scan_class_tooltip_patch = False
+                self._scan_output_mode = "jar_patch"
+                self._server_mode = False
+                self._jar_lock = NullLock()
+                self.analyzed_jars = {}
+                self.analyzed_jars_zh_base = {}
+                self.analyzed_book_texts = {}
+                self.analyzed_book_text_repairs = {}
+                self.analyzed_class_texts = {}
+                self.logs = []
+
+            def set_current_item(self, *_args):
+                pass
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def safe_decode_bytes(self, value):
+                return value.decode("utf-8")
+
+            def _clean_json_text(self, value):
+                return value
+
+            def _lang_value_needs_update(self, _source, _target):
+                return False
+
+            def _to_traditional(self, value):
+                return value
+
+            def _book_text_translatable_paragraphs(self, content):
+                return ["english"] if "English animal text" in content else []
+
+        en_path = "assets/alexsmobs/book/animal_dictionary/en_us/capuchin_monkey.txt"
+        zh_cn_path = "assets/alexsmobs/book/animal_dictionary/zh_cn/capuchin_monkey.txt"
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = os.path.join(tmp, "alexsmobs.jar")
+            with zipfile.ZipFile(jar_path, "w") as jar:
+                jar.writestr(en_path, "<NEWLINE>\n<NEWLINE>\n<NEWLINE>\nEnglish animal text")
+                jar.writestr(zh_cn_path, "<NEWLINE>\n<NEWLINE>\n<NEWLINE>\n简体动物文字")
+
+            app = FakeScanApp()
+            scan_single_jar(app, jar_path)
+
+        self.assertIn(jar_path, app.analyzed_book_texts)
+        self.assertIn(en_path, app.analyzed_book_texts[jar_path])
+        self.assertNotIn(jar_path, app.analyzed_book_text_repairs)
 
 
 class AdaptiveConcurrencyTests(unittest.TestCase):
@@ -640,7 +974,12 @@ class JarPatcherTests(unittest.TestCase):
                             "Accumulator text"
                     }
                 }
-                self.analyzed_book_text_repairs = {}
+                self.analyzed_book_text_repairs = {
+                    jar_path: {
+                        "assets/alexsmobs/book/animal_dictionary/zh_tw/capuchin_monkey.txt":
+                            "捲尾猴文字"
+                    }
+                }
                 self.analyzed_class_texts = {}
                 self.analyzed_extra = []
                 self.analyzed_zip_json = []
@@ -700,6 +1039,8 @@ class JarPatcherTests(unittest.TestCase):
             def process_book_text_content(self, content, *_args):
                 if content == "Accumulator text":
                     return "蓄電器文字"
+                if content == "捲尾猴文字":
+                    return "捲尾猴文字"
                 return content
 
             def _rebuild_jar_with_inject(self, jar_path, temp_jar, inject):
@@ -739,13 +1080,23 @@ class JarPatcherTests(unittest.TestCase):
                 self.assertIn(
                     "assets/immersiveengineering/manual/en_us/accumulators.txt",
                     patched_jar.namelist())
+                self.assertIn(
+                    "assets/alexsmobs/book/animal_dictionary/zh_tw/capuchin_monkey.txt",
+                    patched_jar.namelist())
+                self.assertIn(
+                    "assets/alexsmobs/book/animal_dictionary/en_us/capuchin_monkey.txt",
+                    patched_jar.namelist())
                 data = json.loads(patched_jar.read(
                     "assets/origins-classes/lang/zh_tw.json").decode("utf-8"))
                 manual_text = patched_jar.read(
                     "assets/immersiveengineering/manual/zh_tw/accumulators.txt"
                 ).decode("utf-8")
+                repaired_book = patched_jar.read(
+                    "assets/alexsmobs/book/animal_dictionary/en_us/capuchin_monkey.txt"
+                ).decode("utf-8")
             self.assertEqual(data["origin.origins-classes.warrior.name"], "戰士")
             self.assertEqual(manual_text, "蓄電器文字")
+            self.assertEqual(repaired_book, "捲尾猴文字")
             self.assertTrue(any("只注入語言/手冊/Patchouli/成就文字資源" in line for line in app.logs))
 
     def test_empty_translated_language_is_not_packaged(self):
@@ -854,6 +1205,145 @@ class JarPatcherTests(unittest.TestCase):
             self.assertEqual("", output_path)
             self.assertFalse(os.path.exists(os.path.join(tmp, "中文.zip")))
             self.assertTrue(any("沒有可用繁中譯文" in line for line in app.logs))
+
+    def test_resourcepack_archives_keep_original_output_paths(self):
+        class Var:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        class FakeApp:
+            SYNTHETIC_LANG_ZH_TW = {}
+            ADDITIONAL_ENTITY_ATTRIBUTES_ZH_TW = {}
+            _RE_JAR_SIG = re.compile(r"^META-INF/.*\.(?:SF|DSA|RSA|EC)$", re.I)
+            C_SUCCESS = "success"
+            C_WARN = "warn"
+
+            def __init__(self, jar_path, zip_path):
+                self.stop_requested = False
+                self.logs = []
+                self.analyzed_jars = {
+                    jar_path: {
+                        "assets/example/lang/en_us.json": {
+                            "item.example.jar": "Jar Item"
+                        }
+                    },
+                    zip_path: {
+                        "assets/example/lang/en_us.json": {
+                            "item.example.zip": "Zip Item"
+                        }
+                    },
+                }
+                self.analyzed_jars_zh_base = {}
+                self.analyzed_loose = []
+                self.analyzed_loose_base = {}
+                self.analyzed_book_texts = {}
+                self.analyzed_book_text_repairs = {}
+                self.analyzed_class_texts = {}
+                self.analyzed_extra = []
+                self.analyzed_zip_json = []
+                self.process_mode_var = Var("append")
+                self.include_large_backups_var = Var(False)
+                self.scope_mod_lang_var = Var(False)
+                self.pack_format_var = Var(9)
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def update_progress(self, *_args):
+                pass
+
+            def _output_mode_summary(self):
+                return "JAR 直接套用", ""
+
+            def _set_summary_card(self, *_args):
+                pass
+
+            def _refresh_api_summary(self):
+                pass
+
+            def _scope_allows_analyzed_path(self, *_args):
+                return True
+
+            def _scope_allows_extra(self, *_args):
+                return True
+
+            def _has_openloader_resources(self, *_args):
+                return False
+
+            def _jar_launch_risk_reasons(self, jar_path):
+                return jar_launch_risk_reasons(jar_path)
+
+            def _jar_rewrite_is_high_risk(self, reasons):
+                return jar_rewrite_is_high_risk(reasons)
+
+            def _load_official_minecraft_zh_base(self, *_args):
+                return None
+
+            def _is_advancement_json_path(self, *_args):
+                return False
+
+            def _is_structured_book_json_path(self, *_args):
+                return False
+
+            def _to_traditional(self, value):
+                return value
+
+            def process_json_data(self, data, *_args, **_kwargs):
+                return {
+                    key: ("JAR 物品" if value == "Jar Item" else "ZIP 物品")
+                    for key, value in data.items()
+                }
+
+            def _filter_lang_output_entries(self, _source_data, output_data):
+                return output_data, 0, 0
+
+            def _rebuild_jar_with_inject(self, jar_path, temp_jar, inject):
+                return rebuild_jar_with_inject(
+                    jar_path, temp_jar, inject, self._RE_JAR_SIG)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mc_dir = os.path.join(tmp, "mc")
+            rp_dir = os.path.join(mc_dir, "resourcepacks")
+            os.makedirs(rp_dir)
+            jar_path = os.path.join(rp_dir, "shared.jar")
+            zip_path = os.path.join(rp_dir, "shared.zip")
+            for archive_path, key, value in (
+                    (jar_path, "item.example.jar", "Jar Item"),
+                    (zip_path, "item.example.zip", "Zip Item")):
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    archive.writestr("assets/example/lang/en_us.json", json.dumps({
+                        key: value
+                    }))
+
+            app = FakeApp(jar_path, zip_path)
+            output_path = generate_jar_patches(app, tmp, "中文.zip", mc_dir)
+
+            self.assertTrue(os.path.exists(output_path))
+            with zipfile.ZipFile(output_path) as pack:
+                self.assertIn("resourcepacks/shared.jar", pack.namelist())
+                self.assertIn("resourcepacks/shared.zip", pack.namelist())
+                self.assertNotIn("mods/shared.jar", pack.namelist())
+                self.assertNotIn("mods/shared.zip", pack.namelist())
+                jar_bytes = pack.read("resourcepacks/shared.jar")
+                zip_bytes = pack.read("resourcepacks/shared.zip")
+
+            for payload, key, expected in (
+                    (jar_bytes, "item.example.jar", "JAR 物品"),
+                    (zip_bytes, "item.example.zip", "ZIP 物品")):
+                nested_path = os.path.join(tmp, f"{key}.zip")
+                with open(nested_path, "wb") as f:
+                    f.write(payload)
+                with zipfile.ZipFile(nested_path) as nested:
+                    self.assertIn("assets/example/lang/zh_tw.json", nested.namelist())
+                    data = json.loads(nested.read(
+                        "assets/example/lang/zh_tw.json").decode("utf-8"))
+                self.assertEqual(data[key], expected)
+
+            self.assertTrue(any("resourcepacks/shared.jar" in line for line in app.logs))
+            self.assertTrue(any("resourcepacks/shared.zip" in line for line in app.logs))
 
     def test_high_risk_patchouli_with_paxi_rebuilds_safe_text_json(self):
         class Var:
@@ -1160,7 +1650,9 @@ class GuiDelegateTests(unittest.TestCase):
         fake._force_ignore_cache_strings = {"Old", "Fresh"}
         fake._session_translated_keys = {"Fresh"}
 
-        self.assertFalse(ModTranslatorApp._cache_has_usable_translation(fake, "Old"))
+        # force 模式下仍允許快取 fallback：翻譯引擎未翻到的字串，
+        # 輸出時會從快取取回，避免產生未翻譯的輸出
+        self.assertTrue(ModTranslatorApp._cache_has_usable_translation(fake, "Old"))
         self.assertTrue(ModTranslatorApp._cache_has_usable_translation(fake, "Fresh"))
 
     def test_cache_helper_rejects_passthrough_english(self):

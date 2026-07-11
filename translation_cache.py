@@ -80,6 +80,9 @@ class TranslationCacheStore(MutableMapping):
         # 每批都落盤仍會讓 UI 偶發卡頓。
         # 先放在記憶體，定時存檔或結束時再批次落盤。
         self._pending: Dict[str, str] = {}
+        # 追蹤 _pending 中「DB 裡不存在」的新 key 數量，
+        # 讓 __len__ 不必逐筆查詢 DB。
+        self._pending_new_count: int = 0
 
     @property
     def shelve_path(self) -> str:
@@ -109,6 +112,7 @@ class TranslationCacheStore(MutableMapping):
             pending,
         )
         self._pending.clear()
+        self._pending_new_count = 0
         return len(pending)
 
     def __getitem__(self, key: str) -> str:
@@ -130,19 +134,30 @@ class TranslationCacheStore(MutableMapping):
             safe_key = sanitize_text(str(key))
             safe_value = sanitize_text(str(value))
             if _entry_valid(safe_key, safe_value, self._format_re, self._is_valid):
+                # 只有「尚未在 _pending 且不在 DB」的 key 才算新增
+                if safe_key not in self._pending:
+                    row = self._db.execute(
+                        "SELECT 1 FROM cache WHERE source = ? LIMIT 1",
+                        (safe_key,),
+                    ).fetchone()
+                    if not row:
+                        self._pending_new_count += 1
                 self._pending[safe_key] = safe_value
 
     def __delitem__(self, key: str) -> None:
         with self._lock:
             safe_key = sanitize_text(str(key))
             had_pending = safe_key in self._pending
-            self._pending.pop(safe_key, None)
-            if had_pending and safe_key not in self:
-                return
             cur = self._db.execute(
                 "DELETE FROM cache WHERE source = ?",
                 (safe_key,),
             )
+            if had_pending:
+                self._pending.pop(safe_key, None)
+                # DB 沒有舊值時，pending 才代表尚未計入 DB 的新 key。
+                if cur.rowcount == 0 and self._pending_new_count > 0:
+                    self._pending_new_count -= 1
+                return
             if cur.rowcount == 0:
                 raise KeyError(key)
 
@@ -159,17 +174,7 @@ class TranslationCacheStore(MutableMapping):
     def __len__(self) -> int:
         with self._lock:
             db_len = self._db.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
-            if not self._pending:
-                return int(db_len)
-            pending_new = 0
-            for key in self._pending:
-                row = self._db.execute(
-                    "SELECT 1 FROM cache WHERE source = ? LIMIT 1",
-                    (key,),
-                ).fetchone()
-                if not row:
-                    pending_new += 1
-            return int(db_len) + pending_new
+            return int(db_len) + self._pending_new_count
 
     def __contains__(self, key: object) -> bool:
         if not isinstance(key, str):
@@ -232,7 +237,15 @@ class TranslationCacheStore(MutableMapping):
         with self._lock:
             safe_key = sanitize_text(str(key))
             if safe_key in self._pending:
-                return self._pending.pop(safe_key)
+                val = self._pending[safe_key]
+                cur = self._db.execute(
+                    "DELETE FROM cache WHERE source = ?",
+                    (safe_key,),
+                )
+                self._pending.pop(safe_key)
+                if cur.rowcount == 0 and self._pending_new_count > 0:
+                    self._pending_new_count -= 1
+                return val
             row = self._db.execute(
                 "SELECT translated FROM cache WHERE source = ?",
                 (safe_key,),
@@ -248,6 +261,7 @@ class TranslationCacheStore(MutableMapping):
     def clear(self) -> None:
         with self._lock:
             self._pending.clear()
+            self._pending_new_count = 0
             self._db.execute("DELETE FROM cache")
             self._db.commit()
 
@@ -263,6 +277,14 @@ class TranslationCacheStore(MutableMapping):
                 safe_key = sanitize_text(str(key))
                 safe_value = sanitize_text(str(value))
                 if _entry_valid(safe_key, safe_value, self._format_re, self._is_valid):
+                    # 只有「尚未在 _pending 且不在 DB」的 key 才算新增
+                    if safe_key not in self._pending:
+                        row = self._db.execute(
+                            "SELECT 1 FROM cache WHERE source = ? LIMIT 1",
+                            (safe_key,),
+                        ).fetchone()
+                        if not row:
+                            self._pending_new_count += 1
                     self._pending[safe_key] = safe_value
                     written += 1
             if sync:

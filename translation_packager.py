@@ -18,6 +18,20 @@ _LOCALIZED_MANUAL_MARKERS = (
 _LOCALIZED_MANUAL_EXTENSIONS = ('.json', '.txt')
 
 
+def is_safe_archive_path(path):
+    """Return whether path is a canonical relative POSIX archive member."""
+    if not isinstance(path, str) or not path or '\x00' in path or '\\' in path:
+        return False
+    if path.startswith('/') or re.match(r'^[A-Za-z]:', path):
+        return False
+
+    member_path = path[:-1] if path.endswith('/') else path
+    if not member_path:
+        return False
+    return all(segment not in ('', '.', '..')
+               for segment in member_path.split('/'))
+
+
 def sanitize_text(text):
     """Remove Unicode surrogate code points that cannot be encoded as UTF-8."""
     if not isinstance(text, str):
@@ -146,7 +160,9 @@ def is_localized_manual_resource(path):
 
 def translated_lang_path(path_in_jar):
     """Return the zh_tw output path for a jar language/manual path, or None."""
-    path = (path_in_jar or '').replace('\\', '/')
+    if not is_safe_archive_path(path_in_jar):
+        return None
+    path = path_in_jar
     lower = path.lower()
     if '/patchouli_books/' in lower:
         localized = replace_locale_segment(path, 'zh_tw')
@@ -189,6 +205,28 @@ def translated_fallback_paths(path_in_jar):
     is_book_file = '/book/' in lower and lower.endswith(('.json', '.txt'))
     if is_patchouli_json or is_book_file or is_localized_manual_resource(path):
         return (path,)
+    return ()
+
+
+def translated_repair_fallback_paths(path_in_jar):
+    """Return fallback source-locale paths for repaired zh_tw book/manual data.
+
+    Some manual renderers ignore or only partially honor zh_tw resources and
+    continue reading en_us. When we only reflow/repair an existing zh_tw or
+    zh_cn-derived page, mirror the fixed Traditional Chinese payload to en_us
+    in the overlay as well so the in-game fallback path cannot show English.
+    """
+    path = (path_in_jar or "").replace('\\', '/')
+    lower = path.lower()
+    lang = locale_segment(path)
+    if lang != 'zh_tw':
+        return ()
+    is_patchouli_json = '/patchouli_books/' in lower and lower.endswith('.json')
+    is_book_file = '/book/' in lower and lower.endswith(('.json', '.txt'))
+    if is_patchouli_json or is_book_file or is_localized_manual_resource(path):
+        fallback = replace_locale_segment(path, 'en_us')
+        if fallback != path:
+            return (fallback,)
     return ()
 
 
@@ -277,6 +315,36 @@ def merge_jar_lang_data(lang_data, zh_base, process_json_data, to_traditional):
     return {**zh_base_trad, **translated_data}
 
 
+def merge_zh_base_fallback(fallback_base, primary_base):
+    """Use zh_cn as a fallback for incomplete zh_tw resources.
+
+    Some mods ship a placeholder zh_tw file with only one or two keys while a
+    much more complete zh_cn file exists. Treating that partial zh_tw as the
+    whole base makes the generated zh_tw drop many visible strings when an
+    engine returns a pass-through value. This merge keeps primary zh_tw values,
+    but fills missing nested dict/list entries from zh_cn before Traditional
+    conversion happens later in the packaging flow.
+    """
+    if not primary_base:
+        return fallback_base
+    if not fallback_base:
+        return primary_base
+    if isinstance(fallback_base, dict) and isinstance(primary_base, dict):
+        merged = dict(fallback_base)
+        for key, value in primary_base.items():
+            merged[key] = merge_zh_base_fallback(fallback_base.get(key), value)
+        return merged
+    if isinstance(fallback_base, list) and isinstance(primary_base, list):
+        merged = list(fallback_base)
+        for idx, value in enumerate(primary_base):
+            if idx < len(merged):
+                merged[idx] = merge_zh_base_fallback(merged[idx], value)
+            else:
+                merged.append(value)
+        return merged
+    return primary_base
+
+
 def _value_needs_update(source, existing, value_needs_update=None):
     if not isinstance(source, str):
         return False
@@ -360,6 +428,7 @@ def merge_structured_json_with_existing_zh(source_data, zh_base, process_json_da
                 existing_value = existing_list[idx] if idx < len(existing_list) else None
                 translated_value = translated[idx] if idx < len(translated) else None
                 merged.append(merge_node(source_value, existing_value, translated_value))
+            merged.extend(existing_list[len(source):])
             return merged
         if isinstance(source, str):
             if isinstance(existing, str) and not _value_needs_update(

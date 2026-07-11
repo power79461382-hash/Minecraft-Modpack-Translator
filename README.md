@@ -122,13 +122,13 @@ pip install -r requirements.txt
 執行測試：
 
 ```powershell
-python -m unittest tests.test_translation_core
+python -m pytest tests/ -q
 ```
 
 語法檢查：
 
 ```powershell
-python -m py_compile .\MinecraftTranslatorGUI.py .\translation_packager.py .\translation_cache.py .\translator_providers.py .\translate_cli.py .\gui\main_window.py .\core\translation_flow.py .\core\jar_patcher.py
+python -m py_compile .\MinecraftTranslatorGUI.py .\translation_packager.py .\translation_cache.py .\translator_providers.py .\translate_cli.py .\gui\main_window.py .\core\translation_flow.py .\core\jar_patcher.py .\core\batch_translation.py .\core\class_patcher.py .\core\config_store.py .\core\format_mask.py .\core\json_utils.py
 ```
 
 建置 Windows EXE：
@@ -150,17 +150,32 @@ MinecraftTranslatorGUI.py      GUI 啟動入口
 gui/main_window.py             主要桌面介面、設定、分析與流程協調
 core/analysis_scan.py          整合包掃描與來源收集
 core/string_extraction.py      可翻譯文字抽取
-core/batch_translation.py      批次翻譯、引擎切換、限流處理
+core/batch_translation.py      批次翻譯、引擎切換、限流處理、累計等待上限
 core/translation_flow.py       翻譯流程、進度、輸出前驗證
 core/jar_patcher.py            JAR/ZIP 安全注入與打包
 core/file_parsers.py           JSON/SNBT/任務檔解析與修復
 core/verification.py           輸出與翻譯覆蓋驗證
+core/class_patcher.py          Class 檔案 UTF-8 字串擷取、MUTF8 編解碼、硬編碼 tooltip 修補
+core/config_store.py           API Key 加密儲存（Windows DPAPI）、設定檔讀寫
+core/format_mask.py            格式碼遮罩/還原系統（佔位符防碰撞）
+core/json_utils.py             JSON 文字清理（BOM、註解、尾逗號、控制字元修復）
 translator_providers.py        Bing、Azure、GTX、DeepL、AI provider 實作
 translation_packager.py        資源包、JAR 補丁與資料檔打包工具
-translation_cache.py           翻譯快取與記憶池
+translation_cache.py           翻譯快取與記憶池（O(1) len 優化）
 translate_cli.py               CLI 入口
 tests/test_translation_core.py 核心行為測試
+tests/test_should_translate.py should_translate 邊界條件測試
+tests/test_format_mask.py      格式碼遮罩/還原往返一致性測試
+tests/test_cli.py              CLI 參數解析與過濾邏輯測試
 ```
+
+## 安全性
+
+- API Key 使用 Windows DPAPI 加密儲存，加密後的金鑰只能在同一台機器解密。
+- 非 Windows 平台 fallback 到 Base64 編碼（跨平台相容）。
+- 向後相容：讀取時自動偵測 `DPAPI:` 前綴使用 DPAPI 解密，否則用舊 Base64。
+- 格式碼遮罩使用防碰撞佔位符，避免翻譯引擎產生的文字與佔位符衝突。
+- 翻譯批次引擎有累計等待上限（5 分鐘），避免所有引擎限流時程式無限等待。
 
 ## 不應上傳的資料
 
@@ -178,4 +193,39 @@ tests/test_translation_core.py 核心行為測試
 
 ## 專案狀態
 
-目前工具已能處理大型整合包的主要翻譯來源，並已針對常見崩潰原因加上防護：空 `zh_tw` 輸出、FTB Quests type 被翻譯、Patchouli 巨集破壞、Unicode surrogate、已簽名 JAR 與高風險啟動 JAR。後續可持續改善的方向是提高動態 tooltip 覆蓋率、改善不同書本格式的版面推斷，以及針對各翻譯引擎做更細的自適應併發。
+目前工具已能處理大型整合包的主要翻譯來源，並已針對常見崩潰原因加上防護：空 `zh_tw` 輸出、FTB Quests type 被翻譯、Patchouli 巨集破壞、Unicode surrogate、已簽名 JAR 與高風險啟動 JAR。
+
+### 2026-07-08 程式碼優化與重構
+
+已完成 10 項優化，全部完成 ✅，測試從 58 個增加到 104 個，全部通過。主要改進：
+
+- **效能**：`TranslationCacheStore.__len__` 從 O(n) 逐筆查詢優化為 O(1) 計數器，大快取分析階段不再卡頓。
+- **架構**：從 `main_window.py`（315KB/6247 行）提取 4 個獨立核心模組（`class_patcher.py`、`config_store.py`、`format_mask.py`、`json_utils.py`），15 個方法全部替換為薄包裝，檔案縮減至 294KB/5900 行。
+- **安全**：API Key 改用 Windows DPAPI 加密，取代 Base64 編碼；向後相容舊格式。格式碼佔位符加入隨機 token 防碰撞。
+- **穩定性**：`process_chunk_smart` 新增 5 分鐘累計等待上限，避免所有引擎限流時單一批次卡死數十分鐘。`save_cache` 不再每次重複載入記憶池。
+- **測試**：新增 `test_should_translate.py`（20+ 邊界情況）、`test_format_mask.py`（遮罩往返一致性）、`test_cli.py`（CLI 參數解析）。
+- **清理**：刪除 28 個舊 EXE 備份，釋放約 418MB 磁碟空間。
+
+後續可持續改善的方向是提高動態 tooltip 覆蓋率、改善不同書本格式的版面推斷，以及針對各翻譯引擎做更細的自適應併發。
+
+### 2026-07-08 Force 模式翻譯丟失修復
+
+修復 force 模式下三個獨立 bug 導致大量內容未翻譯的問題：
+
+- **Bug 1**：掃描階段 force 模式跳過 `zh_base_local` 設定，`zh_cn` fallback 被計算但從未保存
+- **Bug 2**：輸出階段 force 模式直接清空 `zh_base = {}`，`zh_cn` 的 104 條翻譯完全被浪費
+- **Bug 3**：force 模式忽略快取和記憶池 fallback，翻譯引擎未翻到的字串直接輸出原文
+
+修復後 force 模式仍會重新翻譯所有字串，但：
+- `zh_cn` fallback 在掃描和輸出階段都正確保留和合併
+- 翻譯引擎未翻到的字串會從快取/記憶池取回，避免未翻譯輸出
+- Origins datapack 中的 `name`/`description` 正確翻譯
+
+### 2026-07-10 可靠性與封裝安全修復
+
+- 批次排程會在部分請求失敗後繼續補充工作，並拒絕長度錯誤、空值或非字串的翻譯結果。
+- AI JSON 回應改為嚴格檢查完整鍵值；付費引擎回應異常時會正確切換到備援引擎。
+- 修復快取刪除後舊資料復活、force 模式誤把舊快取視為新翻譯，以及空白 `zh_tw` 未重新翻譯。
+- ZIP/JAR 掃描拒絕路徑穿越項目，保留重複 ZIP 成員的正確內容，並移除修改後失效的簽章摘要。
+- 修復 Patchouli 格式標記、結構化清單尾端遺失與 CLI 輸出名稱越界。
+- 測試套件擴充至 170 項，涵蓋快取、供應商、批次翻譯、封裝安全、CLI 與 force 流程。

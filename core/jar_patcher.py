@@ -72,6 +72,38 @@ def jar_rewrite_is_high_risk(risk_reasons: Iterable[str]) -> bool:
     })
 
 
+def _strip_manifest_digest_headers(manifest: bytes) -> Tuple[bytes, bool]:
+    """Remove digest attributes and their continuation lines from a manifest."""
+    cleaned_lines = []
+    skip_continuations = False
+    removed = False
+    for line in manifest.splitlines(keepends=True):
+        if line.startswith(b' '):
+            if skip_continuations:
+                removed = True
+                continue
+            cleaned_lines.append(line)
+            continue
+
+        skip_continuations = False
+        header_name = line.split(b':', 1)[0].strip().lower()
+        is_digest_header = (
+            header_name == b'digest-algorithms'
+            or re.fullmatch(
+                rb'[a-z0-9][a-z0-9-]*-digest'
+                rb'(?:-manifest(?:-main-attributes)?)?',
+                header_name,
+                flags=re.IGNORECASE,
+            ) is not None
+        )
+        if is_digest_header:
+            skip_continuations = True
+            removed = True
+            continue
+        cleaned_lines.append(line)
+    return b''.join(cleaned_lines), removed
+
+
 def rebuild_jar_with_inject(jar_path: str, temp_jar: str,
                             inject: Dict[str, bytes],
                             jar_sig_re: Pattern[str]) -> bool:
@@ -87,13 +119,12 @@ def rebuild_jar_with_inject(jar_path: str, temp_jar: str,
             if modifies_existing and jar_sig_re.match(item.filename):
                 stripped_sig = True
                 continue
-            data_bytes = src_jar.read(item.filename)
+            data_bytes = src_jar.read(item)
             if (modifies_existing
-                    and item.filename.upper() == 'META-INF/MANIFEST.MF'
-                    and b'-Digest' in data_bytes):
-                head = re.split(rb'\r?\n\r?\n', data_bytes, 1)[0]
-                data_bytes = head + b'\r\n\r\n'
-                stripped_sig = True
+                    and item.filename.upper() == 'META-INF/MANIFEST.MF'):
+                data_bytes, removed_digests = _strip_manifest_digest_headers(
+                    data_bytes)
+                stripped_sig = stripped_sig or removed_digests
             dst_jar.writestr(item, data_bytes)
         for inj_path, inj_bytes in inject.items():
             dst_jar.writestr(inj_path, inj_bytes)
@@ -202,6 +233,7 @@ from translation_packager import (
     is_localized_manual_resource,
     translated_fallback_paths,
     translated_lang_path,
+    translated_repair_fallback_paths,
 )
 
 
@@ -378,15 +410,35 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
     with tempfile.TemporaryDirectory() as tmpdir, \
          zipfile.ZipFile(combined_zip_path, 'w', zipfile.ZIP_DEFLATED) as combined:
 
+        def archive_rel_path(abs_path):
+            rel_path = os.path.relpath(abs_path, mc_dir).replace('\\', '/')
+            if rel_path.startswith('..') or os.path.isabs(rel_path):
+                rel_path = os.path.join('mods', os.path.basename(abs_path)).replace('\\', '/')
+            return rel_path
+
+        def is_mod_archive_rel(rel_path):
+            normalized = rel_path.replace('\\', '/').lower()
+            return normalized.endswith('.jar') and (
+                normalized.startswith('mods/') or '/' not in normalized)
+
+        def temp_archive_path(index, rel_path):
+            ext = os.path.splitext(rel_path)[1] or '.jar'
+            safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '_', rel_path).strip(' ._')
+            if not safe_name:
+                safe_name = f'archive_{index}{ext}'
+            if not safe_name.lower().endswith(ext.lower()):
+                safe_name += ext
+            return os.path.join(tmpdir, f'{index:05d}_{safe_name}')
+
         def add_original_backup(abs_path, rel_path):
             nonlocal backup_count, skipped_large_backup_count
             if not abs_path or not os.path.exists(abs_path):
                 return
             normalized_rel = rel_path.replace('\\', '/')
-            is_jar_backup = normalized_rel.lower().endswith('.jar')
+            is_large_archive_backup = normalized_rel.lower().endswith(('.jar', '.zip'))
             include_large_backups = bool(
                 getattr(getattr(self, 'include_large_backups_var', None), 'get', lambda: False)())
-            if is_jar_backup and not include_large_backups:
+            if is_large_archive_backup and not include_large_backups:
                 skipped_large_backup_count += 1
                 return
             backup_rel = '_backups/' + normalized_rel
@@ -420,15 +472,14 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
                     seen_jar_paths.add(jar_path)
                     jar_paths_to_patch.append(jar_path)
 
-        for jar_path in jar_paths_to_patch:
+        for archive_index, jar_path in enumerate(jar_paths_to_patch, 1):
             if self.stop_requested:
                 break
             lang_files = self.analyzed_jars.get(jar_path, {})
             jar_name = os.path.basename(jar_path)
-            jar_rel = os.path.relpath(jar_path, mc_dir).replace('\\', '/')
-            if jar_rel.startswith('..'):
-                jar_rel = os.path.join('mods', jar_name).replace('\\', '/')
-            temp_jar = os.path.join(tmpdir, jar_name)
+            jar_rel = archive_rel_path(jar_path)
+            temp_jar = temp_archive_path(archive_index, jar_rel)
+            is_mod_archive = is_mod_archive_rel(jar_rel)
 
             risk_reasons = self._jar_launch_risk_reasons(jar_path)
             high_risk_rewrite = self._jar_rewrite_is_high_risk(risk_reasons)
@@ -444,7 +495,9 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
                            .get(jar_path, {})
                            .get(path_in_jar, {}))
                 if self.process_mode_var.get() == "force":
-                    zh_base = {}
+                    # force 模式不應丟棄 zh_cn fallback，
+                    # 只是不管 zh_tw 是否已存在都重新翻譯
+                    pass
                 else:
                     official_base = self._load_official_minecraft_zh_base(mc_dir, path_in_jar)
                     if official_base:
@@ -458,6 +511,10 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
                     merged_data = merge_structured_json_with_existing_zh(
                         lang_data, zh_base, process_book_data, self._to_traditional,
                         value_needs_update=self._lang_value_needs_update)
+                    if hasattr(self, "_repair_structured_book_json_output"):
+                        merged_data = self._repair_structured_book_json_output(
+                            lang_data, zh_base, merged_data, process_book_data,
+                            f"{jar_name}:{path_in_jar}")
                 else:
                     def process_jar_data(data, preserve=False, strict=False, _path=path_in_jar):
                         return self.process_json_data(
@@ -520,13 +577,23 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
                     break
                 if not self._scope_allows_analyzed_path("book_txt", path_in_jar):
                     continue
-                inject[path_in_jar] = safe_utf8_bytes(self.process_book_text_content(content, path_in_jar))
+                fixed_payload = safe_utf8_bytes(self.process_book_text_content(content, path_in_jar))
+                inject[path_in_jar] = fixed_payload
+                for fallback_path in translated_repair_fallback_paths(path_in_jar):
+                    inject[fallback_path] = fixed_payload
                 current_task += 1
                 self.update_progress(current_task, total_tasks)
 
             class_files = self.analyzed_class_texts.get(jar_path, {})
             if class_files:
-                if high_risk_rewrite:
+                if not is_mod_archive:
+                    class_count = sum(len(strings) for strings in class_files.values())
+                    current_task += class_count
+                    self.update_progress(current_task, total_tasks)
+                    self.log(
+                        f"  🛡️ {jar_rel}: 非 mods/根目錄 JAR，跳過 class tooltip 修補，"
+                        "只輸出語言與書本資源。")
+                elif high_risk_rewrite:
                     class_count = sum(len(strings) for strings in class_files.values())
                     current_task += class_count
                     self.update_progress(current_task, total_tasks)
@@ -618,11 +685,12 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
                 continue
 
             # 將修改後的 JAR 依原始相對路徑加入合併包；
-            # mods/foo.jar 保持在 mods/，版本根目錄 JAR 保持在根目錄。
+            # mods/foo.jar 保持在 mods/，resourcepacks/datapacks ZIP/JAR 保持在原資料夾。
             combined.write(temp_jar, jar_rel,
                            compress_type=zipfile.ZIP_STORED)
             jar_count += 1
-            self.log(f"  ✅ {jar_name}（注入 {len(inject)} 個語言檔）")
+            archive_kind = "模組 JAR" if is_mod_archive else "資源/資料包"
+            self.log(f"  ✅ {jar_rel}（{archive_kind}，注入 {len(inject)} 個語言/書本檔）")
 
         # ── 散落 en_us.json（非 JAR 內）+ 附加檔案 (snbt/json/md) → 同一個合併包 ──
         written_cfg_paths = set()
@@ -751,7 +819,7 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
                 with zipfile.ZipFile(zip_path, 'r') as src_zip, \
                      zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as dst_zip:
                     for item in src_zip.infolist():
-                        data = src_zip.read(item.filename)
+                        data = src_zip.read(item)
                         if item.filename in internal_set and item.filename.lower().endswith('.json'):
                             try:
                                 content = self.safe_decode_bytes(data)

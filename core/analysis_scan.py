@@ -11,10 +11,12 @@ from translation_packager import (
     ftbq_lang_snbt_role,
     is_localized_manual_resource,
     is_preferred_manual_source,
+    is_safe_archive_path,
     locale_segment,
     load_lang_content,
     manual_source_group_key,
     manual_source_priority,
+    merge_zh_base_fallback,
     replace_locale_segment,
     structured_json_needs_update,
     translated_lang_path,
@@ -27,6 +29,122 @@ GENERATED_TRANSLATOR_DIR_MARKERS = (
 )
 
 SINGLE_JAR_SCAN_BUDGET_SECONDS = 120.0
+
+TOP_LEVEL_SCAN_IGNORE = {'libraries', 'bin', 'jre', 'versions'}
+RUNTIME_CACHE_DIRS = {
+    '.fabric',
+    '.mixin.out',
+    'downloads',
+    'dynamic-resource-pack-cache',
+    'moddata',
+    'pcl',
+    'xaero',
+    'logs',
+    'crash-reports',
+    'saves',
+    'shaderpacks',
+    'shader_packs',
+    'screenshots',
+    'backups',
+    'backup',
+    'out',
+    'output',
+    'outputs',
+    'failed items',
+    'dynmap',
+    'webcache',
+    'texturepacks',
+    'world',
+    'worlds',
+    'local',
+    'natives',
+}
+ASSETS_CACHE_DIRS = {'indexes', 'objects', 'skins', 'log_configs'}
+ZIP_RESOURCE_ROOTS = {
+    'resourcepacks',
+    'global_packs',
+    'globalpacks',
+}
+ZIP_DATA_ROOTS = {
+    'datapacks',
+    'global_packs',
+    'globalpacks',
+    'moonlight-global-datapacks',
+}
+
+
+def _rel_parts(base_dir, path):
+    try:
+        rel = os.path.relpath(path, base_dir).replace('\\', '/')
+    except ValueError:
+        rel = os.path.basename(path)
+    return [part for part in rel.split('/') if part and part != '.']
+
+
+def _rel_lower(base_dir, path):
+    return '/'.join(part.lower() for part in _rel_parts(base_dir, path))
+
+
+def _has_runtime_cache_segment(parts):
+    for part in parts:
+        lower = part.lower()
+        if lower in RUNTIME_CACHE_DIRS:
+            return True
+        if lower.endswith('-natives') or lower.endswith('_natives'):
+            return True
+    return False
+
+
+def should_descend_scan_dir(mod_dir, root_dir, dirname):
+    """Return whether os.walk should descend into a directory.
+
+    The scanner must avoid launcher/runtime caches such as .fabric processed
+    jars. Those files look like valid mod jars, but they are not authoritative
+    sources and do not get loaded from the final translated package.
+    """
+    lower = dirname.lower()
+    if lower in RUNTIME_CACHE_DIRS:
+        return False
+    if lower.endswith('-natives') or lower.endswith('_natives'):
+        return False
+    if is_translator_generated_dir_name(dirname):
+        return False
+    is_top = os.path.normcase(os.path.normpath(root_dir)) == os.path.normcase(os.path.normpath(mod_dir))
+    if is_top and lower in TOP_LEVEL_SCAN_IGNORE:
+        return False
+    rel_root = _rel_lower(mod_dir, root_dir)
+    if rel_root == 'assets' and lower in ASSETS_CACHE_DIRS:
+        return False
+    return True
+
+
+def should_scan_translation_archive(mod_dir, path):
+    """Return whether a jar/zip is a real translation source for this modpack."""
+    parts = _rel_parts(mod_dir, path)
+    if not parts:
+        return False
+    lower_parts = [part.lower() for part in parts]
+    if _has_runtime_cache_segment(lower_parts):
+        return False
+    if any(is_translator_generated_dir_name(part) for part in parts):
+        return False
+    ext = os.path.splitext(parts[-1])[1].lower()
+    top = lower_parts[0]
+    rel = '/'.join(lower_parts)
+    is_pack_archive = (
+        top in ZIP_RESOURCE_ROOTS
+        or top in ZIP_DATA_ROOTS
+        or '/resourcepacks/' in rel
+        or '/datapacks/' in rel
+        or '/openloader/resources/' in rel
+        or '/paxi/resourcepacks/' in rel
+        or '/paxi/datapacks/' in rel
+    )
+    if ext == '.jar':
+        return len(parts) == 1 or top == 'mods' or is_pack_archive
+    if ext == '.zip':
+        return is_pack_archive
+    return False
 
 
 def is_translator_generated_dir_name(name: str) -> bool:
@@ -87,7 +205,10 @@ def scan_single_jar(self, path):
                     "已略過剩餘內容以避免分析卡死")
                 return True
 
-            infos = jar.infolist()
+            infos = [
+                info for info in jar.infolist()
+                if is_safe_archive_path(info.filename)
+            ]
             # 建立 小寫名稱 → 原始名稱 對照表（比 set 多一步但只掃一次）
             all_lower_to_orig = {i.filename.lower(): i.filename for i in infos}
             all_names_lower   = frozenset(all_lower_to_orig)
@@ -158,10 +279,27 @@ def scan_single_jar(self, path):
                             zh_tw_data = load_lang_content(zh_tw_str, zh_tw_fn, self._clean_json_text)
                         except (json.JSONDecodeError, ValueError):
                             zh_tw_data = {}
+                        zh_base_data = zh_tw_data
+                        zh_cn_lower = lang_dir + 'zh_cn' + lang_suffix
+                        if lang_name != 'zh_cn' and zh_cn_lower in all_names_lower:
+                            try:
+                                zh_cn_fn = all_lower_to_orig[zh_cn_lower]
+                                with jar.open(zh_cn_fn) as f:
+                                    zh_cn_str = self.safe_decode_bytes(f.read())
+                                zh_cn_data = load_lang_content(
+                                    zh_cn_str, zh_cn_fn, self._clean_json_text)
+                                if isinstance(zh_cn_data, dict):
+                                    zh_base_data = merge_zh_base_fallback(zh_cn_data, zh_tw_data)
+                            except Exception:
+                                pass
                         if process_mode == "force":
                             if lang_name != 'en_us':
                                 self.log(f"ℹ️ {os.path.basename(path)}: 使用 {os.path.basename(fn)} 作為翻譯來源（無 en_us）")
                             lang_files[fn] = src_data
+                            # 即使在 force 模式下，也要保留 zh_base（含 zh_cn fallback），
+                            # 否則 zh_cn 的翻譯會被浪費，輸出時無法合併
+                            if zh_base_data:
+                                zh_base_local[fn] = zh_base_data
                             continue
                         # 保留 zh_tw 未覆蓋、空值、值等同原文（未翻譯複製）、
                         # 或混英值（已含中文但殘留英文單詞）的條目
@@ -181,7 +319,7 @@ def scan_single_jar(self, path):
                             if lang_name != 'en_us':
                                 self.log(f"ℹ️ {os.path.basename(path)}: 使用 {os.path.basename(fn)} 作為翻譯來源（無 en_us）")
                             lang_files[fn]    = missing
-                            zh_base_local[fn] = zh_tw_data
+                            zh_base_local[fn] = zh_base_data
                     except Exception as e:
                         # 不能靜默丟棄整個語言目錄，否則該模組「整包沒被翻」卻無從追查
                         self.log(f"⚠️ {os.path.basename(path)}: 解析 {fn} 失敗，已跳過此語言檔（{e}）")
@@ -316,8 +454,22 @@ def scan_single_jar(self, path):
                                 if not structured_json_needs_update(
                                         src_data, zh_tw_data, self._lang_value_needs_update):
                                     continue
+                                zh_base_data = zh_tw_data
+                                zh_cn_lower_p = replace_locale_segment(fn_lower, 'zh_cn')
+                                if source_locale != 'zh_cn' and zh_cn_lower_p in all_names_lower:
+                                    try:
+                                        zh_cn_fn = all_lower_to_orig[zh_cn_lower_p]
+                                        with jar.open(zh_cn_fn) as f:
+                                            zh_cn_decoded = self.safe_decode_bytes(f.read())
+                                        zh_cn_data = load_json_lenient(
+                                            zh_cn_decoded, self._clean_json_text)
+                                        if isinstance(zh_cn_data, dict):
+                                            zh_base_data = merge_zh_base_fallback(
+                                                zh_cn_data, zh_tw_data)
+                                    except Exception:
+                                        pass
                                 lang_files[fn] = src_data
-                                zh_base_local[fn] = zh_tw_data
+                                zh_base_local[fn] = zh_base_data
                                 continue
                             except Exception:
                                 # 既有 zh_tw 讀不出或格式不穩，改用來源重新產生安全覆蓋。
@@ -329,12 +481,16 @@ def scan_single_jar(self, path):
                             with jar.open(zh_cn_fn) as f:
                                 zh_cn_decoded = self.safe_decode_bytes(f.read())
                             if is_book_txt or is_localized_manual_txt:
-                                zh_tw_fn = all_lower_to_orig.get(zh_tw_lower_p, fn.replace('/en_us/', '/zh_tw/'))
-                                book_text_repairs[zh_tw_fn] = self._to_traditional(zh_cn_decoded)
-                                continue
-                            zh_cn_data = load_json_lenient(zh_cn_decoded, self._clean_json_text)
-                            if isinstance(zh_cn_data, dict):
-                                zh_base_local[fn] = zh_cn_data
+                                if not (source_locale and source_locale.startswith('en_')):
+                                    zh_tw_fn = all_lower_to_orig.get(
+                                        zh_tw_lower_p,
+                                        replace_locale_segment(fn, 'zh_tw'))
+                                    book_text_repairs[zh_tw_fn] = self._to_traditional(zh_cn_decoded)
+                                    continue
+                            else:
+                                zh_cn_data = load_json_lenient(zh_cn_decoded, self._clean_json_text)
+                                if isinstance(zh_cn_data, dict):
+                                    zh_base_local[fn] = zh_cn_data
                         except Exception:
                             pass
                 try:
@@ -459,18 +615,6 @@ def run_analyze_task_impl(self, mod_dir):
     scope_quests = self._scan_scope_quests
     self.log("\n--- 開始全域掃描分析（JAR 並發掃描已啟用）---")
     self.log("掃描對象：語言檔 / Patchouli 手冊 / FTB 任務書(.snbt) / 任務 JSON / Markdown")
-    # 只在頂層跳過（Minecraft 系統資料夾，不含模組設定）
-    top_level_ignore = {'assets', 'libraries', 'bin', 'jre', 'versions'}
-    # 所有層級都跳過（世界存檔、日誌、快取等）
-    # 注意：resourcepacks 不再忽略——整合包內建的資源包常用 en_us 覆寫
-    # 物品名稱（如 Prominence II 的 Prominent-UI、Enhanced Boss Bars），
-    # 不翻的話會以英文蓋過我們的翻譯
-    all_level_ignore = {'.git', 'logs', 'crash-reports', 'saves',
-                        'shaderpacks', 'shader_packs', 'screenshots',
-                        'backups', 'backup',
-                        'out', 'output', 'outputs', 'failed items',
-                        'dynmap', 'webcache', 'texturepacks',
-                        'world', 'worlds', 'local'}
     jar_paths = []
     self._last_scan_jar_paths = jar_paths
 
@@ -491,52 +635,65 @@ def run_analyze_task_impl(self, mod_dir):
     for root_dir, dirs, files in os.walk(mod_dir):
         if self.stop_requested:
             break
-        is_top = (os.path.normpath(root_dir) == os.path.normpath(mod_dir))
-        dirs[:] = [d for d in dirs
-                   if d not in all_level_ignore
-                   and not is_translator_generated_dir_name(d)
-                   and (not is_top or d not in top_level_ignore)]
+        dirs[:] = [d for d in dirs if should_descend_scan_dir(mod_dir, root_dir, d)]
 
         for file in files:
             if self.stop_requested:
                 break
             path      = os.path.join(root_dir, file)
             path_norm = path.replace('\\', '/').lower()
+            rel_norm  = _rel_lower(mod_dir, path)
             ext       = file.lower().rsplit('.', 1)[-1] if '.' in file else ''
 
             if ext == 'jar':
-                jar_paths.append(path)
+                if should_scan_translation_archive(mod_dir, path):
+                    jar_paths.append(path)
 
             elif ext == 'zip':
-                in_dp = '/datapacks/' in path_norm
-                in_rp = '/resourcepacks/' in path_norm
+                if not should_scan_translation_archive(mod_dir, path):
+                    continue
+                in_dp = (
+                    rel_norm.startswith('datapacks/')
+                    or rel_norm.startswith('moonlight-global-datapacks/')
+                    or rel_norm.startswith('global_packs/')
+                    or rel_norm.startswith('globalpacks/')
+                    or '/datapacks/' in rel_norm
+                    or '/paxi/datapacks/' in rel_norm
+                )
+                in_rp = (
+                    rel_norm.startswith('resourcepacks/')
+                    or rel_norm.startswith('global_packs/')
+                    or rel_norm.startswith('globalpacks/')
+                    or '/resourcepacks/' in rel_norm
+                    or '/paxi/resourcepacks/' in rel_norm
+                )
                 in_openloader_resources = self._is_openloader_resources_zip_path(path_norm)
-                if in_dp or in_rp or in_openloader_resources:
-                    try:
-                        with zipfile.ZipFile(path, 'r') as z:
-                            has_en_lang = False
-                            for info in z.infolist():
-                                fn_lower = info.filename.replace('\\', '/').lower()
-                                if info.is_dir():
-                                    continue
-                                # 資源包帶 en_us 語言覆寫 → 整包當 JAR 掃描/修補
-                                if ((in_rp or in_openloader_resources)
-                                        and fn_lower.startswith('assets/')
-                                        and fn_lower.endswith('/lang/en_us.json')):
-                                    has_en_lang = True
-                                # Origins 類 datapack JSON（原有功能）
-                                if ((scope_quests or scope_books)
-                                        and fn_lower.endswith('.json')
-                                        and fn_lower.startswith('data/')
-                                        and ('/origins/' in fn_lower
-                                             or '/powers/' in fn_lower
-                                             or '/origin_layers/' in fn_lower
-                                             or '/classes/' in fn_lower)):
-                                    self.analyzed_zip_json.append((path, info.filename))
-                            if has_en_lang and scope_mod_lang:
-                                jar_paths.append(path)
-                    except (zipfile.BadZipFile, OSError) as e:
-                        self.log(f"⚠️ 無法開啟 ZIP {os.path.basename(path)}: {e}")
+                try:
+                    with zipfile.ZipFile(path, 'r') as z:
+                        has_en_lang = False
+                        for info in z.infolist():
+                            if (info.is_dir()
+                                    or not is_safe_archive_path(info.filename)):
+                                continue
+                            fn_lower = info.filename.lower()
+                            # 資源包帶 en_us 語言覆寫 → 整包當 JAR 掃描/修補
+                            if ((in_rp or in_openloader_resources)
+                                    and fn_lower.startswith('assets/')
+                                    and fn_lower.endswith('/lang/en_us.json')):
+                                has_en_lang = True
+                            # Origins 類 datapack JSON（原有功能）
+                            if ((scope_quests or scope_books)
+                                    and fn_lower.endswith('.json')
+                                    and fn_lower.startswith('data/')
+                                    and ('/origins/' in fn_lower
+                                         or '/powers/' in fn_lower
+                                         or '/origin_layers/' in fn_lower
+                                         or '/classes/' in fn_lower)):
+                                self.analyzed_zip_json.append((path, info.filename))
+                        if has_en_lang and scope_mod_lang:
+                            jar_paths.append(path)
+                except (zipfile.BadZipFile, OSError) as e:
+                    self.log(f"⚠️ 無法開啟 ZIP {os.path.basename(path)}: {e}")
 
             elif ext == 'snbt':
                 # 只收集任務書相關的 snbt（排除 ftblibrary 設定等）
@@ -597,13 +754,16 @@ def run_analyze_task_impl(self, mod_dir):
                                 try:
                                     src_content = self.safe_read_file(src_path)
                                     zh_content  = self.safe_read_file(zh_tw_path)
-                                    if src_content.strip() and zh_content.strip():
+                                    if src_content.strip():
                                         src_data = load_lang_content(
                                             src_content, src_path, self._clean_json_text)
-                                        try:
-                                            zh_data = load_lang_content(
-                                                zh_content, zh_tw_path, self._clean_json_text)
-                                        except (json.JSONDecodeError, ValueError):
+                                        if zh_content.strip():
+                                            try:
+                                                zh_data = load_lang_content(
+                                                    zh_content, zh_tw_path, self._clean_json_text)
+                                            except (json.JSONDecodeError, ValueError):
+                                                zh_data = {}
+                                        else:
                                             zh_data = {}
                                         if process_mode == "force":
                                             if src_lang != 'en_us':

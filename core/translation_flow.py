@@ -21,6 +21,7 @@ from translation_packager import (
     safe_utf8_bytes,
     translated_fallback_paths,
     translated_lang_path,
+    translated_repair_fallback_paths,
 )
 
 
@@ -70,12 +71,20 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
         # 不要在翻譯開始前把全域記憶池命中逐筆寫入 shelve 快取。
         # 38k 詞彙、1w+ 記憶池命中會變成大量磁碟隨機寫入，導致第一階段長時間卡住。
         # 輸出時 get_translation() 已會讀取記憶池，所以這裡只做集合比對。
+        # force 模式仍使用記憶池和快取作為 fallback：翻譯引擎未翻到的字串，
+        # 輸出時會從快取/記憶池取回，避免產生未翻譯的輸出。
         cache_keys = set() if force_mode else set(self.translation_cache.keys())
-        memory = self._load_translation_memory() if self.global_memory_var.get() and not force_mode else {}
+        memory = self._load_translation_memory() if self.global_memory_var.get() else {}
         memory_keys = set(memory.keys()) if memory else set()
-        cache_hit_strings = unique_strings & cache_keys
-        memory_hit_strings = (unique_strings - cache_hit_strings) & memory_keys
-        missing_strings = sorted(unique_strings - cache_hit_strings - memory_hit_strings)
+        if force_mode:
+            cache_hit_strings = set()
+            memory_hit_strings = set()
+            missing_strings = sorted(unique_strings)
+        else:
+            cache_hit_strings = unique_strings & cache_keys
+            memory_hit_strings = (unique_strings - cache_hit_strings) & memory_keys
+            missing_strings = sorted(
+                unique_strings - cache_hit_strings - memory_hit_strings)
         cache_hits = len(cache_hit_strings) + len(memory_hit_strings)
         self._analysis_total_strings = len(unique_strings)
         self._analysis_cache_hits = cache_hits
@@ -117,8 +126,11 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
             if self.stop_requested:
                 break
             still_missing = [s for s in unique_strings
-                             if not self._cache_has_usable_translation(s)
-                             and s not in memory_keys
+                             if not (
+                                 s in self._session_translated_keys
+                                 if force_mode
+                                 else self._cache_has_usable_translation(s))
+                             and (force_mode or s not in memory_keys)
                              and not self._RE_CJK_CHAR.search(s)   # 混中英=已翻過，重試浪費配額
                              and self.should_translate(s)]
             if not still_missing:
@@ -338,7 +350,9 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
                                .get(jar_path, {})
                                .get(path_in_jar, {}))
                     if self.process_mode_var.get() == "force":
-                        zh_base = {}
+                        # force 模式不應丟棄 zh_cn fallback，
+                        # 只是不管 zh_tw 是否已存在都重新翻譯
+                        pass
                     else:
                         official_base = self._load_official_minecraft_zh_base(mc_dir, path_in_jar)
                         if official_base:
@@ -352,6 +366,10 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
                         merged_data = merge_structured_json_with_existing_zh(
                             lang_data, zh_base, process_book_data, self._to_traditional,
                             value_needs_update=self._lang_value_needs_update)
+                        if hasattr(self, "_repair_structured_book_json_output"):
+                            merged_data = self._repair_structured_book_json_output(
+                                lang_data, zh_base, merged_data, process_book_data,
+                                f"{jar_name}:{path_in_jar}")
                     else:
                         def process_jar_data(data, preserve=False, strict=False, _path=path_in_jar):
                             return self.process_json_data(
@@ -429,7 +447,12 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
                         continue
                     fixed_text = self.process_book_text_content(content, path_in_jar)
                     self.log(f"📘 {jar_name}: 修正書本換行 {path_in_jar}")
-                    write_output(path_in_jar, safe_utf8_bytes(fixed_text))
+                    fixed_bytes = safe_utf8_bytes(fixed_text)
+                    write_output(path_in_jar, fixed_bytes)
+                    for fallback_path in translated_repair_fallback_paths(path_in_jar):
+                        if fallback_path != path_in_jar:
+                            write_output(fallback_path, fixed_bytes)
+                            self.log(f"📘 {jar_name}: {fallback_path}（fallback 修復覆蓋）")
                     current_task += 1
                     self.update_progress(current_task, total_tasks, text_mode=False)
 
@@ -558,7 +581,7 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
                     with zipfile.ZipFile(zip_path, 'r') as src_zip, \
                          zipfile.ZipFile(out_zip, 'w', zipfile.ZIP_DEFLATED) as dst_zip:
                         for item in src_zip.infolist():
-                            data = src_zip.read(item.filename)
+                            data = src_zip.read(item)
                             if item.filename in internal_set and item.filename.lower().endswith('.json'):
                                 try:
                                     content = self.safe_decode_bytes(data)

@@ -129,6 +129,16 @@ def likely_bing_passthrough(text):
     return title_words / len(words) >= 0.65
 
 
+def _translation_result_is_complete(source_items, translated_items):
+    """Return whether a provider produced one non-blank string per input."""
+    return (
+        isinstance(translated_items, (list, tuple))
+        and len(translated_items) == len(source_items)
+        and all(isinstance(item, str) and item.strip()
+                for item in translated_items)
+    )
+
+
 def interruptible_sleep(should_stop, seconds, quantum=0.2):
     """Sleep in short slices so stop/pause requests are observed promptly."""
     deadline = time.monotonic() + max(0.0, float(seconds))
@@ -442,7 +452,7 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
             "http 500", "http 502", "http 503", "http 504",
             "service unavailable", "temporarily unavailable",
             "connection", "timeout", "timed out", "連線失敗",
-            "network", "max retries",
+            "network", "max retries", "incomplete translation response",
         ))
 
     # 顯示引擎池資訊
@@ -461,7 +471,15 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
         self.log(f"⚙️ 翻譯並發：{workers}/{max_workers}（主引擎：{ENG_LABEL.get(primary_id, primary_id)}）")
     adaptive_controller = AdaptiveConcurrency(workers, minimum=1, maximum=workers)
 
+    def _incomplete_result_error(eng):
+        prefix = ("DISABLED:" if strict_paid_primary and eng == primary_id
+                  else "ERR:")
+        return (f"{prefix}{ENG_LABEL.get(eng, eng)} "
+                "incomplete translation response")
+
     def process_chunk_smart(chunk_data, preferred_engine=None):
+        _MAX_CUMULATIVE_WAIT = 300  # 累計等待上限 5 分鐘，避免單一批次卡死
+        _cumulative_wait = 0.0
         for _ in range(60):
             if self.stop_requested:
                 return chunk_data, None, None
@@ -469,7 +487,11 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
             if eng is None:
                 if wait == -1:
                     return chunk_data, None, "所有翻譯引擎已停用（額度耗盡或 Key 無效），略過此批次"
-                self.log(f"⏳ 所有引擎限流，等待 {wait:.0f}s...")
+                if _cumulative_wait + wait > _MAX_CUMULATIVE_WAIT:
+                    self.log(f"⏱️ 累計等待已達 {_cumulative_wait:.0f}s 上限，放棄此批次")
+                    return chunk_data, None, f"所有引擎持續限流超過 {_MAX_CUMULATIVE_WAIT}s，略過此批次"
+                _cumulative_wait += wait
+                self.log(f"⏳ 所有引擎限流，等待 {wait:.0f}s...（累計 {_cumulative_wait:.0f}s/{_MAX_CUMULATIVE_WAIT}s）")
                 if not interruptible_sleep(
                         lambda: self.stop_requested,
                         wait + random.uniform(0, 1)):
@@ -485,6 +507,9 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
             request_started = time.monotonic()
             trans, err = dispatch[eng](masked_chunk)
             request_elapsed = time.monotonic() - request_started
+            if err is None and not _translation_result_is_complete(
+                    chunk_data, trans):
+                err = _incomplete_result_error(eng)
             if err is None:
                 # 成功 → 清除此引擎的連續錯誤計數
                 with eng_lock:
@@ -571,12 +596,20 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
                 merged = []
                 split_ok = True
                 for lo, hi in ((0, mid), (mid, len(chunk_data))):
+                    sub_chunk = chunk_data[lo:hi]
                     sub_trans, sub_err = dispatch[eng](masked_chunk[lo:hi])
-                    if sub_err or not sub_trans:
+                    if sub_err:
+                        err = sub_err
+                        split_ok = False
+                        break
+                    if not _translation_result_is_complete(
+                            sub_chunk, sub_trans):
+                        err = _incomplete_result_error(eng)
                         split_ok = False
                         break
                     merged.extend(sub_trans)
-                if split_ok and len(merged) == len(chunk_data):
+                if split_ok and _translation_result_is_complete(
+                        chunk_data, merged):
                     with eng_lock:
                         error_counts[eng] = 0
                     trans = [self._unmask_format(t, mp)
@@ -717,18 +750,23 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
                     bulk_update = getattr(self.translation_cache, "bulk_update", None)
                     if callable(bulk_update):
                         try:
-                            translated_count = bulk_update(changed_pairs, sync=False)
+                            bulk_update(changed_pairs, sync=False)
                         except TypeError:
-                            translated_count = bulk_update(changed_pairs)
+                            bulk_update(changed_pairs)
                     else:
                         for orig, validated in changed_pairs:
                             self.translation_cache[orig] = validated
-                            translated_count += 1
-                    if translated_count > 0:
+                    accepted_pairs = [
+                        (orig, validated)
+                        for orig, validated in changed_pairs
+                        if self.translation_cache.get(orig) == validated
+                    ]
+                    translated_count = len(accepted_pairs)
+                    if accepted_pairs:
                         self._session_translated_keys = getattr(
                             self, "_session_translated_keys", set())
                         self._session_translated_keys.update(
-                            orig for orig, _ in changed_pairs)
+                            orig for orig, _ in accepted_pairs)
                 processed_count = len(chunk_data) if chunk_data else 0
                 skipped_count = max(0, processed_count - translated_count)
                 if self.stop_requested:
@@ -771,6 +809,7 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
                         eta_str = ""
                     self.log(f"{ENG_LABEL.get(cur, cur)} [{done}/{total}]{eta_str} (例: {sample}...)")
                 self._maybe_save_cache()
-                submit_until_limit()
                 if self.stop_requested:
                     break
+            if not self.stop_requested:
+                submit_until_limit()

@@ -40,6 +40,25 @@ from core.file_parsers import (
     snbt_skip_by_key as core_snbt_skip_by_key,
     snbt_structure_signature as core_snbt_structure_signature,
 )
+from core.class_patcher import (
+    has_cjk_text as core_has_cjk_text,
+    decode_mutf8 as core_decode_mutf8,
+    class_utf8_entries as core_class_utf8_entries,
+    is_hardcoded_lore_string as core_is_hardcoded_lore_string,
+    mutf8_encode as core_mutf8_encode,
+    patch_class_hardcoded_strings as core_patch_class_hardcoded_strings,
+)
+from core.format_mask import (
+    mask_format as core_mask_format,
+    unmask_format as core_unmask_format,
+    fix_placeholders as core_fix_placeholders,
+    repair_patchouli_macros as core_repair_patchouli_macros,
+)
+from core.config_store import (
+    obfuscate as core_obfuscate,
+    deobfuscate as core_deobfuscate,
+)
+from core.json_utils import clean_json_text as core_clean_json_text
 from core.translation_flow import run_translate_task
 from core.jar_patcher import (
     build_class_inject_for_jar as core_build_class_inject_for_jar,
@@ -60,6 +79,7 @@ from translation_cache import (
 from translation_packager import (
     drop_untranslated_lang_entries,
     load_lang_content,
+    merge_structured_json_with_existing_zh,
     sanitize_text,
     sanitize_value,
 )
@@ -82,6 +102,13 @@ class ModTranslatorApp:
         r'^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_\-]+)*:[A-Za-z0-9_/\-]*\.[A-Za-z0-9_/\.\-]+$')
     _RE_FILEPATH   = re.compile(r'^[\w\-/]+\.\w+$')
     _RE_DOTPATH    = re.compile(r'^[a-z0-9_]+(\.[a-z0-9_]+)+$', re.IGNORECASE)
+    _STRUCTURAL_REF_EXTS = {
+        'nbt', 'schem', 'schematic', 'mcstructure',
+        'png', 'jpg', 'jpeg', 'webp', 'gif', 'ogg', 'wav',
+        'json', 'mcmeta', 'toml', 'cfg', 'properties', 'yaml', 'yml',
+        'class', 'jar', 'zip',
+    }
+    _HIGH_RISK_STRUCTURAL_EXTS = {'nbt', 'schem', 'schematic', 'mcstructure'}
     # 三段以上 snake_case（has_xxx_yyy_slab 之類的技術 key）
     _RE_SNAKE_KEY  = re.compile(r'^[a-z0-9]+(?:_[a-z0-9]+){2,}$')
     # CJK 字元（判斷字串是否已是中文）
@@ -3899,10 +3926,44 @@ class ModTranslatorApp:
         return bool(cls._RE_EN_WORD.search(cls._RE_FORMAT.sub('', translated)))
 
     @classmethod
+    def _looks_like_structural_reference(cls, text):
+        """判斷字串是否像資源/結構引用，而不是玩家可見文字。
+
+        Prefab、Patchouli、任務書與資料包常把 .nbt/.schem 等檔名放在 JSON/SNBT
+        字串值中。這些值一旦被翻譯，遊戲會在執行時讀不到原始檔案而崩潰。
+        """
+        if not isinstance(text, str):
+            return False
+        value = text.strip().strip('"\'')
+        if not value or '\n' in value or '\r' in value:
+            return False
+        if re.fullmatch(r'[A-Za-z][A-Za-z0-9+.\-]*://\S+', value):
+            return True
+
+        normalized = value.replace('\\', '/')
+        if cls._RE_NAMESPACE.match(value) or cls._RE_LANG_KEY_REF.match(value):
+            return True
+
+        match = re.search(r'\.([A-Za-z0-9]{2,16})$', normalized)
+        if match:
+            ext = match.group(1).lower()
+            if ext in cls._HIGH_RISK_STRUCTURAL_EXTS:
+                return True
+            if ext in cls._STRUCTURAL_REF_EXTS and (
+                    '/' in normalized or ' ' not in value or cls._RE_FILEPATH.match(normalized)):
+                return True
+
+        if '/' in normalized and ' ' not in value:
+            return bool(re.fullmatch(r'[A-Za-z0-9_./:\-]+', normalized))
+        return False
+
+    @classmethod
     def _lang_value_needs_update(cls, source, translated):
         """判斷既有 zh_tw lang 值是否需要補翻/重翻。"""
         if not isinstance(source, str) or not isinstance(translated, str):
             return True
+        if cls._looks_like_structural_reference(source):
+            return translated.strip() != source.strip()
         if (Counter(cls._critical_format_tokens(source))
                 != Counter(cls._critical_format_tokens(translated))):
             return True
@@ -3979,7 +4040,10 @@ class ModTranslatorApp:
                         self._memory_pool_dirty = True
                 else:
                     changed = 0
-                    self._load_translation_memory()
+                    # 記憶池已在 _load_translation_memory 的 guard 中快取，
+                    # 無需重複載入——只有首次呼叫才會從磁碟讀取
+                    if not getattr(self, "translation_memory", None):
+                        self._load_translation_memory()
                     merged = getattr(self, "_memory_merged_keys", None)
                     if merged is None:
                         merged = self._memory_merged_keys = set()
@@ -4076,14 +4140,11 @@ class ModTranslatorApp:
     # ═══════════════════════════════════════════════
     @staticmethod
     def _obfuscate(key: str) -> str:
-        return base64.b64encode(key.encode('utf-8')).decode('ascii') if key else ""
+        return core_obfuscate(key)
 
     @staticmethod
     def _deobfuscate(encoded: str) -> str:
-        try:
-            return base64.b64decode(encoded.encode('ascii')).decode('utf-8') if encoded else ""
-        except Exception:
-            return encoded
+        return core_deobfuscate(encoded)
 
     def load_config(self):
         if os.path.exists(self.config_file):
@@ -4335,6 +4396,8 @@ class ModTranslatorApp:
             return False
         if self._RE_HEX_ID.match(text):
             return False
+        if self._looks_like_structural_reference(text):
+            return False
         if self._RE_NAMESPACE.match(text):
             return False
         if self._RE_LANG_KEY_REF.match(text):
@@ -4570,182 +4633,31 @@ class ModTranslatorApp:
         return rescued
 
     def fix_placeholders(self, text):
-        if not isinstance(text, str):
-            return text
-        # AI 偶爾把 %s 輸出成全形 ％s → 轉回半形（只在後面接格式字母時）
-        text = re.sub(r'％((?:\d+\$)?[a-zA-Z])', r'%\1', text)
-        text = re.sub(r'%\s*(\d+)\s*\$\s*([a-zA-Z])', r'%\1$\2', text)
-        text = re.sub(r'%\s+([a-zA-Z])',              r'%\1',     text)
-        text = re.sub(r'\\\s+n',                       r'\\n',    text)
-        text = re.sub(r'§\s+([0-9a-fk-or])',           r'§\1',    text)
-        text = re.sub(r'\]\s+\(',                      r'](',     text)
-        text = re.sub(r'!\s+\[',                       r'![',     text)
-        text = self._repair_patchouli_macros(text)
-        text = re.sub(r'\[\s+',                        r'[',      text)
-        text = re.sub(r'\s+\]',                        r']',      text)
-        return text
+        return core_fix_placeholders(text)
 
     @staticmethod
     def _repair_patchouli_macros(text):
-        """修復翻譯過程弄壞的 Patchouli 巨集。
-        合法形態只有 $(指令) 與結尾 $()；實測損壞型態（從整合包現場取樣）：
-        - 全形括號：$（）、$（p）（翻譯引擎把半形轉全形）
-        - 插入空格：$ ( )、$( )
-        - 遮罩殘渣：|~() / !~()（$() 被弄壞的變體）
-        巨集損壞只會變成字面顯示，不會崩潰，但很難看。"""
-        if not isinstance(text, str):
-            return text
-        if '$' not in text and '~(' not in text and '~（' not in text:
-            return text
-        text = re.sub(r'\$\s*（', '$(', text)                       # 全形開括號
-        text = re.sub(r'\$\(([^()（）]{0,240})）', r'$(\1)', text)  # 對應的全形閉括號
-        text = re.sub(r'\$\s*\(\s*\)', '$()', text)                 # $ ( ) / $( ) → $()
-        text = re.sub(r'\$\s+\(', '$(', text)                       # $ (l:... → $(l:...
-        text = re.sub(r'[|｜!！][~～]\s*[（(]\s*[）)]', '$()', text)  # |~() / !~（） 殘渣
-        return text
+        return core_repair_patchouli_macros(text)
 
     @staticmethod
     def _mask_format(text):
-        """將格式符號（§a %s {var} 等）替換成 [#N#] 佔位符，回傳 (masked_text, mapping)"""
-        if not text:
-            return text, {}
-        mapping = {}
-        counter = [0]
-        def _replace(m):
-            marker = f'[#{counter[0]}#]'
-            mapping[marker] = m.group(0)
-            counter[0] += 1
-            return marker
-        masked = ModTranslatorApp._RE_FORMAT.sub(_replace, text)
-        return masked, mapping
+        """將格式符號替換成唯一佔位符，回傳 (masked_text, mapping)"""
+        return core_mask_format(text, ModTranslatorApp._RE_FORMAT)
 
     @staticmethod
     def _unmask_format(text, mapping):
-        """將翻譯結果中的 [#N#] 佔位符還原為原始格式符號（容錯空白）"""
-        if not mapping or not text:
-            return text
-        for marker, original in mapping.items():
-            n = re.escape(marker[2:-2])          # 取出數字部分並跳脫
-            text = re.sub(r'\[\s*#\s*' + n + r'\s*#\s*\]',
-                          lambda _, o=original: o, text)
-        return text
+        """將翻譯結果中的佔位符還原為原始格式符號（容錯空白）"""
+        return core_unmask_format(text, mapping)
 
     @staticmethod
     def _clean_json_text(text):
-        """
-        清理非標準 JSON 文字，依序處理：
-        1. 移除 // 及 /* */ 注解（只處理字串外，避免誤刪 https://）
-        2. 移除物件/陣列尾逗號
-        3. 逐字元掃描：將 JSON 字串值內的所有控制字元（含未跳脫的換行）
-           轉為合法的 \\uXXXX 跳脫序列，結構層的空白不受影響
-        """
-        if not isinstance(text, str):
-            text = str(text)
-        text = text.lstrip('\ufeff')
-
-        def strip_comments(src):
-            out = []
-            in_string = False
-            escape = False
-            i = 0
-            while i < len(src):
-                c = src[i]
-                n = src[i + 1] if i + 1 < len(src) else ''
-                if in_string:
-                    out.append(c)
-                    if escape:
-                        escape = False
-                    elif c == '\\':
-                        escape = True
-                    elif c == '"':
-                        in_string = False
-                    i += 1
-                    continue
-                if c == '"':
-                    in_string = True
-                    out.append(c)
-                    i += 1
-                    continue
-                if c == '/' and n == '/':
-                    i += 2
-                    while i < len(src) and src[i] not in '\r\n':
-                        i += 1
-                    continue
-                if c == '/' and n == '*':
-                    i += 2
-                    while i + 1 < len(src) and not (src[i] == '*' and src[i + 1] == '/'):
-                        i += 1
-                    i += 2 if i + 1 < len(src) else 0
-                    continue
-                out.append(c)
-                i += 1
-            return ''.join(out)
-
-        def strip_trailing_commas(src):
-            out = []
-            in_string = False
-            escape = False
-            i = 0
-            while i < len(src):
-                c = src[i]
-                if in_string:
-                    out.append(c)
-                    if escape:
-                        escape = False
-                    elif c == '\\':
-                        escape = True
-                    elif c == '"':
-                        in_string = False
-                    i += 1
-                    continue
-                if c == '"':
-                    in_string = True
-                    out.append(c)
-                    i += 1
-                    continue
-                if c == ',':
-                    j = i + 1
-                    while j < len(src) and src[j] in ' \t\r\n':
-                        j += 1
-                    if j < len(src) and src[j] in '}]':
-                        i += 1
-                        continue
-                out.append(c)
-                i += 1
-            return ''.join(out)
-
-        text = strip_trailing_commas(strip_comments(text))
-        result = []
-        in_string = False
-        escape = False
-        i = 0
-        while i < len(text):
-            c = text[i]
-            if in_string:
-                if escape:
-                    result.append(c)
-                    escape = False
-                elif c == '\\':
-                    result.append(c)
-                    escape = True
-                elif c == '"':
-                    in_string = False
-                    result.append(c)
-                elif ord(c) < 0x20:
-                    result.append('\\u{:04x}'.format(ord(c)))
-                else:
-                    result.append(c)
-            else:
-                if c == '"':
-                    in_string = True
-                    result.append(c)
-                else:
-                    result.append(c)
-            i += 1
-        return ''.join(result)
+        """清理非標準 JSON 文字（移除注解、尾逗號、控制字元）。"""
+        return core_clean_json_text(text)
 
     def validate_translation(self, orig, trans):
         if not isinstance(trans, str):
+            return orig
+        if self._looks_like_structural_reference(orig):
             return orig
         # 自動將簡體字元轉為繁體，確保快取內容一律為繁體中文
         trans = self._to_traditional(trans)
@@ -4801,6 +4713,94 @@ class ModTranslatorApp:
                         string_set.add(fragment)
             else:
                 string_set.add(data)
+
+    def _collect_untranslated_visible_json_strings(
+            self, source_data, output_data, preserve_technical_keys=False,
+            strict_context=False, _text_parent=False):
+        """Return source strings whose translated structured JSON still renders
+        as English/untranslated.
+
+        This mirrors _collect_strings_json/process_json_data so the output stage
+        can safely retry Patchouli/book JSON without touching structural IDs
+        such as category/type/item/resource locations.
+        """
+        missing = []
+
+        def add_if_needed(source, translated):
+            if not isinstance(source, str) or not self.should_translate(source):
+                return
+            component = self._json_text_component_obj(source)
+            if component is not None:
+                output_text = translated if isinstance(translated, str) else ""
+                output_component = self._json_text_component_obj(output_text)
+                output_values = list(self._walk_json_text_values(output_component)) if output_component is not None else [output_text]
+                output_joined = "\n".join(v for v in output_values if isinstance(v, str))
+                for fragment in self._walk_json_text_values(component):
+                    if (isinstance(fragment, str) and self.should_translate(fragment)
+                            and (fragment in output_joined
+                                 or self._lang_value_needs_update(fragment, output_joined))):
+                        missing.append(fragment)
+                return
+            if (not isinstance(translated, str)
+                    or self._lang_value_needs_update(source, translated)):
+                missing.append(source)
+
+        if isinstance(source_data, dict):
+            output_dict = output_data if isinstance(output_data, dict) else {}
+            for key, value in source_data.items():
+                if preserve_technical_keys and self._is_technical_data_key(key):
+                    continue
+                key_is_text = self._is_strict_text_key(key)
+                if (strict_context and isinstance(value, str)
+                        and not key_is_text
+                        and not (_text_parent
+                                 and str(key).lower() == "translate"
+                                 and self._component_translate_value_is_literal(value))):
+                    continue
+                missing.extend(self._collect_untranslated_visible_json_strings(
+                    value, output_dict.get(key), preserve_technical_keys,
+                    strict_context, _text_parent=key_is_text))
+        elif isinstance(source_data, list):
+            output_list = output_data if isinstance(output_data, list) else []
+            for idx, item in enumerate(source_data):
+                if isinstance(item, str) and strict_context and not _text_parent:
+                    continue
+                translated_item = output_list[idx] if idx < len(output_list) else None
+                missing.extend(self._collect_untranslated_visible_json_strings(
+                    item, translated_item, preserve_technical_keys,
+                    strict_context, _text_parent))
+        elif isinstance(source_data, str):
+            add_if_needed(source_data, output_data)
+
+        return missing
+
+    def _repair_structured_book_json_output(
+            self, source_data, zh_base, merged_data, process_book_data,
+            path_label=""):
+        """Before packaging a book/manual JSON, retry visible fields that are
+        still untranslated. This prevents English text from being written into
+        zh_tw/en_us fallback overlays while preserving technical JSON fields.
+        """
+        missing = self._collect_untranslated_visible_json_strings(
+            source_data, merged_data, strict_context=True)
+        missing = sorted(set(missing))
+        if not missing or self.stop_requested:
+            return merged_data
+
+        label = f" {path_label}" if path_label else ""
+        self.log(f"  ⚠️{label}: 手冊 JSON 尚有 {len(missing):,} 個可見欄位未翻，輸出前補翻一次")
+        self.batch_translate_missing(missing, _force_chunk_size=24)
+
+        repaired = merge_structured_json_with_existing_zh(
+            source_data, zh_base, process_book_data, self._to_traditional,
+            value_needs_update=self._lang_value_needs_update)
+        remaining = sorted(set(self._collect_untranslated_visible_json_strings(
+            source_data, repaired, strict_context=True)))
+        if remaining:
+            self.log(
+                f"  ⚠️{label}: 補翻後仍有 {len(remaining):,} 個手冊欄位未翻，"
+                "已保留結構並交由失敗報告追蹤")
+        return repaired
 
     def _book_text_translatable_paragraphs(self, content):
         """產出書本 txt「會被輸出端查找」的精確段落字串——
@@ -4951,7 +4951,7 @@ class ModTranslatorApp:
 
     @staticmethod
     def _has_cjk_text(text):
-        return isinstance(text, str) and bool(re.search(r'[\u3400-\u9fff]', text))
+        return core_has_cjk_text(text)
 
     @staticmethod
     def _read_u2(data, offset):
@@ -4963,234 +4963,22 @@ class ModTranslatorApp:
 
     @classmethod
     def _decode_mutf8(cls, raw):
-        """Decode Java class constant-pool Modified UTF-8 without leaking surrogates."""
-        if not isinstance(raw, (bytes, bytearray)):
-            return ""
-        units = []
-        i = 0
-        size = len(raw)
-        while i < size:
-            b1 = raw[i]
-            try:
-                if b1 <= 0x7F:
-                    units.append(b1)
-                    i += 1
-                elif (b1 & 0xE0) == 0xC0 and i + 1 < size:
-                    b2 = raw[i + 1]
-                    units.append(((b1 & 0x1F) << 6) | (b2 & 0x3F))
-                    i += 2
-                elif (b1 & 0xF0) == 0xE0 and i + 2 < size:
-                    b2 = raw[i + 1]
-                    b3 = raw[i + 2]
-                    units.append(((b1 & 0x0F) << 12)
-                                 | ((b2 & 0x3F) << 6)
-                                 | (b3 & 0x3F))
-                    i += 3
-                else:
-                    units.append(0xFFFD)
-                    i += 1
-            except Exception:
-                units.append(0xFFFD)
-                i += 1
-        chars = []
-        i = 0
-        while i < len(units):
-            u = units[i]
-            if 0xD800 <= u <= 0xDBFF and i + 1 < len(units):
-                lo = units[i + 1]
-                if 0xDC00 <= lo <= 0xDFFF:
-                    cp = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00)
-                    chars.append(chr(cp))
-                    i += 2
-                    continue
-            if 0xD800 <= u <= 0xDFFF:
-                chars.append("\uFFFD")
-            else:
-                chars.append(chr(u))
-            i += 1
-        return "".join(chars)
+        return core_decode_mutf8(raw)
 
     @classmethod
     def _class_utf8_entries(cls, data):
-        """Return class constant-pool Utf8 entries as dicts with byte offsets."""
-        if not isinstance(data, (bytes, bytearray)) or data[:4] != b'\xca\xfe\xba\xbe':
-            return []
-        try:
-            offset = 8
-            cp_count, offset = cls._read_u2(data, offset)
-            entries = []
-            index = 1
-            while index < cp_count:
-                tag = data[offset]
-                offset += 1
-                if tag == 1:
-                    len_offset = offset
-                    size, offset = cls._read_u2(data, offset)
-                    bytes_offset = offset
-                    raw = bytes(data[bytes_offset:bytes_offset + size])
-                    offset += size
-                    text = cls._decode_mutf8(raw)
-                    entries.append({
-                        "len_offset": len_offset,
-                        "bytes_offset": bytes_offset,
-                        "size": size,
-                        "text": text,
-                    })
-                elif tag in (3, 4):
-                    offset += 4
-                elif tag in (5, 6):
-                    offset += 8
-                    index += 1
-                elif tag in (7, 8, 16, 19, 20):
-                    offset += 2
-                elif tag in (9, 10, 11, 12, 17, 18):
-                    offset += 4
-                elif tag == 15:
-                    offset += 3
-                else:
-                    return []
-                index += 1
-            return entries
-        except (IndexError, ValueError):
-            return []
-
-    # _is_hardcoded_lore_string 用的預編譯 pattern（每個 class 常量都會跑，量大）
-    _RE_LORE_CTRL    = re.compile(r'[\x00-\x1f]')
-    _RE_LORE_WORD4   = re.compile(r'[A-Za-z]{4,}')
-    _RE_LORE_WORD3   = re.compile(r'[A-Za-z]{3,}')
-    _RE_LORE_FMTCODE = re.compile(r'[§”][0-9a-fk-orx]')
-    _RE_LORE_NSREF   = re.compile(r'\b[a-z0-9_]+:[a-z0-9_/.]+')
-    _RE_LORE_WORDS   = re.compile(r"[A-Za-z']{2,}")
+        return core_class_utf8_entries(data)
 
     @classmethod
     def _is_hardcoded_lore_string(cls, text):
-        if not isinstance(text, str):
-            return False
-        s = text.strip()
-        if len(s) < 12 or len(s) > 260:
-            return False
-        if ' ' not in s:           # 最便宜的檢查先做（排除絕大多數常量）
-            return False
-        # 排除程式碼特徵：方法描述符 (L...)V、路徑、類名、控制字元、
-        # 內嵌 JSON/HTML/賦值——這些必須在 § 規則之前擋掉，
-        # 否則 "§7{\"text\":...}" 這種內嵌結構會被當顯示文字翻壞。
-        # 注意：不能排除「含雙引號的一般文句」（如 The "lawbringers" were...），
-        # JSON 靠大括號偵測即可
-        if any(x in s for x in ('\\', ';', ')V', '(L', '.java',
-                                'net/', 'Lnet/', 'com/', 'org/',
-                                '{', '}', '=', '<', '>')) or '://' in s:
-            return False
-        if '":' in s or '" :' in s:   # JSON key 樣式（"text": ...）仍要擋
-            return False
-        if cls._RE_LORE_CTRL.search(s):
-            return False
-        if not cls._RE_LORE_WORD4.search(s):
-            return False
-        lowered = s.lower()
-        if lowered.startswith(('item.', 'block.', 'entity.', 'effect.', 'attribute.', 'key.')):
-            return False
-        if lowered in {
-                'armor modifier',
-                'armor toughness',
-                'armor knockback resistance',
-                'attack damage',
-                'attack speed',
-                'explosion resistance',
-                'opening the jack in the box!',
-        }:
-            return False
-        if lowered.startswith((
-                'input block is missing',
-                'result block is missing',
-                'the event was not fired',
-                'our container provider is missing',
-                'itemlightsources only contains',
-        )):
-            return False
-        if cls._RE_LORE_NSREF.search(s):
-            return False
-        # § 顏色/格式碼是最強訊號：只出現在顯示文字、絕不會是邏輯字串
-        # （MCreator 模組的逐行 tooltip 如 "§8Right-clicking increases" 全靠這條）
-        if cls._RE_LORE_FMTCODE.search(s) and cls._RE_LORE_WORD3.search(s):
-            return True
-        markers = (
-            '[full set bonus]', '[unique effect]', 'armor worn by',
-            'legendary weapon', 'grants ', 'reduces ', 'boosts ',
-            'inflicts ', 'damage ', 'health', 'armor', 'resistance',
-            'chance ', 'when above', 'incoming damage', 'fatal damage',
-            'crafting of powerful tools', 'powerful tools and equipment',
-            'pristine coin', 'celebration of momentous events',
-            '[on key press]', 'sets hp', 'invulnerability',
-            'night vision', 'water breathing', 'jump boost',
-            'nearby players', 'rewind time',
-            '[right click ability]', '[shift right click]', 'on right click',
-            'while held', 'when held', 'in main hand', 'in off hand',
-        )
-        if any(marker in lowered for marker in markers):
-            return True
-        # 句子型敘述（如 "A gust of wind lifts and propels you through the air."）：
-        # ≥5 個英文單詞、以句號/驚嘆/問號結尾、開頭大寫——白名單詞沒涵蓋的整句 tooltip。
-        # 無 § 碼的句子額外排除含 '/' 的（路徑型 log 訊息如 "Saved to config/x.toml."）
-        if '/' in s:
-            return False
-        if lowered.startswith(('error', 'failed', 'unable', 'cannot',
-                               'could not', 'couldn\'t', 'warning', 'exception',
-                               'invalid', 'missing', 'unknown', 'unexpected',
-                               'saved ', 'loading', 'loaded ', 'registered')):
-            return False
-        words = cls._RE_LORE_WORDS.findall(s)
-        if len(words) >= 5 and s.rstrip().endswith(('.', '!', '?')):
-            head = s.lstrip('§0123456789abcdefklmnorx[] ')
-            return bool(head[:1].isupper())
-        return False
+        return core_is_hardcoded_lore_string(text)
 
     @staticmethod
     def _mutf8_encode(text):
-        """Java class 常量池要求 Modified UTF-8（JVM 規範 §4.4.7）：
-        U+0000 編成 0xC0 0x80；非 BMP 字元拆成 surrogate pair 各 3 bytes（共 6 bytes）。
-        用標準 UTF-8 寫入 4-byte 序列會讓 JVM 拋 ClassFormatError → 模組拒載。"""
-        out = bytearray()
-        for ch in text:
-            cp = ord(ch)
-            if cp == 0:
-                out += b'\xc0\x80'
-            elif cp <= 0xFFFF:
-                out += ch.encode('utf-8')
-            else:
-                cp -= 0x10000
-                for sur in (0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF)):
-                    out += bytes([0xE0 | (sur >> 12),
-                                  0x80 | ((sur >> 6) & 0x3F),
-                                  0x80 | (sur & 0x3F)])
-        return bytes(out)
+        return core_mutf8_encode(text)
 
     def _patch_class_hardcoded_strings(self, data, replacements):
-        entries = self._class_utf8_entries(data)
-        if not entries or not replacements:
-            return data, 0
-        out = bytearray()
-        cursor = 0
-        changed = 0
-        for entry in entries:
-            text = entry["text"]
-            translated = replacements.get(text)
-            if not translated or translated == text:
-                continue
-            encoded = self._mutf8_encode(translated)
-            if len(encoded) > 65535:
-                continue
-            len_offset = entry["len_offset"]
-            bytes_offset = entry["bytes_offset"]
-            end = bytes_offset + entry["size"]
-            out.extend(data[cursor:len_offset])
-            out.extend(len(encoded).to_bytes(2, 'big'))
-            out.extend(encoded)
-            cursor = end
-            changed += 1
-        if changed:
-            out.extend(data[cursor:])
-            return bytes(out), changed
-        return data, 0
+        return core_patch_class_hardcoded_strings(data, replacements)
 
     def extract_all_unique_strings(self):
         return core_extract_all_unique_strings(self)
@@ -5263,10 +5051,8 @@ class ModTranslatorApp:
         """
         if not isinstance(text, str) or text not in self.translation_cache:
             return False
-        ignored = getattr(self, "_force_ignore_cache_strings", None)
-        if ignored and text in ignored:
-            if text not in getattr(self, "_session_translated_keys", set()):
-                return False
+        # force 模式下仍允許快取 fallback：翻譯引擎未翻到的字串，
+        # 輸出時會從快取取回，避免產生未翻譯的輸出
         translated = self.translation_cache.get(text)
         return self._is_valid_trad_translation(text, translated)
 
@@ -5277,15 +5063,23 @@ class ModTranslatorApp:
         session_keys = getattr(self, "_session_translated_keys", set())
         for candidate in self._translation_lookup_candidates(text):
             hit = None
-            if not (ignored and candidate in ignored and candidate not in session_keys):
+            # force 模式下：如果本輪已翻譯（在 session_keys），直接用新翻譯。
+            # 如果本輪未翻到（不在 session_keys），仍允許從快取 fallback，
+            # 避免翻譯引擎未翻到的字串變成未翻譯的原文輸出。
+            if candidate in session_keys:
                 hit = self.translation_cache.get(candidate)
-            # 強制重翻時，分析出的字串也不要用舊記憶池補回來。
-            memory_allowed = not (ignored and candidate in ignored and candidate not in session_keys)
+            elif not ignored or candidate not in ignored:
+                hit = self.translation_cache.get(candidate)
+            else:
+                # force 模式下未翻譯的字串，也允許快取 fallback
+                hit = self.translation_cache.get(candidate)
+            # 記憶池同樣允許 fallback
             if not hit and memory is not None:
-                hit = memory.get(candidate) if memory_allowed else None
+                hit = memory.get(candidate)
             if not hit:
                 continue
             hit = self._restyle_swapped_hit(text, candidate, hit)
+            hit = self.validate_translation(text, hit)
             return sanitize_text(self._rewrap_quoted_translation(text, candidate, hit))
         return text
 

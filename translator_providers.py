@@ -182,6 +182,14 @@ def _parse_translation_json(content, expected_count):
     json_text, parsed = _extract_json_object_text(content)
     if not isinstance(parsed, dict):
         raise TypeError("model JSON response must be an object")
+    for index in range(expected_count):
+        key = str(index)
+        if key not in parsed:
+            raise TypeError(
+                f"model JSON response is missing expected translation key {key!r}")
+        if not isinstance(parsed[key], str):
+            raise TypeError(
+                f"model JSON response value for key {key!r} must be a string")
     return parsed
 
 
@@ -216,7 +224,7 @@ def ai_chunk(session, chunk_data, post_url, req_headers, make_body,
             if finish_reason.lower() in ("length", "max_tokens"):
                 return None, f"ERR:{eng_name} 模型輸出被截斷，請降低執行緒/批次或提高 max_tokens"
             trans_dict = _parse_translation_json(content, len(chunk_data))
-            return [trans_dict.get(str(i), chunk_data[i])
+            return [trans_dict[str(i)]
                     for i in range(len(chunk_data))], None
         if res.status_code == 429:
             return None, "429:60"
@@ -391,6 +399,16 @@ def build_provider_registry(session, settings):
                 if err:
                     return None, err
                 return left + right, None
+
+            if len(batch) > 1:
+                results = []
+                for item in batch:
+                    item_result, err = _gtx_batch_translate(
+                        [item], params_fn, depth + 1)
+                    if err:
+                        return None, err
+                    results.append(item_result[0] if item_result else None)
+                return results, None
 
             res = _gtx_request(params_fn, batch[0], (5, 12))
             if res.status_code == 429:
