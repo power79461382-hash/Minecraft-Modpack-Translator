@@ -80,6 +80,9 @@ class TranslationCacheStore(MutableMapping):
         # 每批都落盤仍會讓 UI 偶發卡頓。
         # 先放在記憶體，定時存檔或結束時再批次落盤。
         self._pending: Dict[str, str] = {}
+        # 追蹤 _pending 中「DB 裡不存在」的新 key 數量，
+        # 讓 __len__ 不必逐筆查詢 DB。
+        self._pending_new_count: int = 0
 
     @property
     def shelve_path(self) -> str:
@@ -109,6 +112,7 @@ class TranslationCacheStore(MutableMapping):
             pending,
         )
         self._pending.clear()
+        self._pending_new_count = 0
         return len(pending)
 
     def __getitem__(self, key: str) -> str:
@@ -130,19 +134,30 @@ class TranslationCacheStore(MutableMapping):
             safe_key = sanitize_text(str(key))
             safe_value = sanitize_text(str(value))
             if _entry_valid(safe_key, safe_value, self._format_re, self._is_valid):
+                # 只有「尚未在 _pending 且不在 DB」的 key 才算新增
+                if safe_key not in self._pending:
+                    row = self._db.execute(
+                        "SELECT 1 FROM cache WHERE source = ? LIMIT 1",
+                        (safe_key,),
+                    ).fetchone()
+                    if not row:
+                        self._pending_new_count += 1
                 self._pending[safe_key] = safe_value
 
     def __delitem__(self, key: str) -> None:
         with self._lock:
             safe_key = sanitize_text(str(key))
             had_pending = safe_key in self._pending
-            self._pending.pop(safe_key, None)
-            if had_pending and safe_key not in self:
-                return
             cur = self._db.execute(
                 "DELETE FROM cache WHERE source = ?",
                 (safe_key,),
             )
+            if had_pending:
+                self._pending.pop(safe_key, None)
+                # DB 沒有舊值時，pending 才代表尚未計入 DB 的新 key。
+                if cur.rowcount == 0 and self._pending_new_count > 0:
+                    self._pending_new_count -= 1
+                return
             if cur.rowcount == 0:
                 raise KeyError(key)
 
@@ -156,20 +171,50 @@ class TranslationCacheStore(MutableMapping):
             keys.extend(k for k in self._pending.keys() if k not in existing)
             return iter(keys)
 
+    def snapshot(self, keys=None) -> Dict[str, str]:
+        """Return a consistent read-only snapshot with pending values applied."""
+        with self._lock:
+            if keys is None:
+                rows = self._db.execute(
+                    "SELECT source, translated FROM cache"
+                ).fetchall()
+                result = dict(rows)
+                result.update(self._pending)
+                return result
+
+            requested = {
+                str(key): sanitize_text(str(key))
+                for key in keys
+                if key is not None
+            }
+            if not requested:
+                return {}
+
+            canonical_values: Dict[str, str] = {}
+            requested_list = list(set(requested.values()))
+            # Stay below SQLite's host-parameter limit on older bundled builds.
+            for start in range(0, len(requested_list), 500):
+                batch = requested_list[start:start + 500]
+                placeholders = ','.join('?' for _ in batch)
+                rows = self._db.execute(
+                    f"SELECT source, translated FROM cache "
+                    f"WHERE source IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                canonical_values.update(rows)
+            for canonical_key in requested_list:
+                if canonical_key in self._pending:
+                    canonical_values[canonical_key] = self._pending[canonical_key]
+            return {
+                original_key: canonical_values[canonical_key]
+                for original_key, canonical_key in requested.items()
+                if canonical_key in canonical_values
+            }
+
     def __len__(self) -> int:
         with self._lock:
             db_len = self._db.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
-            if not self._pending:
-                return int(db_len)
-            pending_new = 0
-            for key in self._pending:
-                row = self._db.execute(
-                    "SELECT 1 FROM cache WHERE source = ? LIMIT 1",
-                    (key,),
-                ).fetchone()
-                if not row:
-                    pending_new += 1
-            return int(db_len) + pending_new
+            return int(db_len) + self._pending_new_count
 
     def __contains__(self, key: object) -> bool:
         if not isinstance(key, str):
@@ -232,7 +277,15 @@ class TranslationCacheStore(MutableMapping):
         with self._lock:
             safe_key = sanitize_text(str(key))
             if safe_key in self._pending:
-                return self._pending.pop(safe_key)
+                val = self._pending[safe_key]
+                cur = self._db.execute(
+                    "DELETE FROM cache WHERE source = ?",
+                    (safe_key,),
+                )
+                self._pending.pop(safe_key)
+                if cur.rowcount == 0 and self._pending_new_count > 0:
+                    self._pending_new_count -= 1
+                return val
             row = self._db.execute(
                 "SELECT translated FROM cache WHERE source = ?",
                 (safe_key,),
@@ -248,6 +301,7 @@ class TranslationCacheStore(MutableMapping):
     def clear(self) -> None:
         with self._lock:
             self._pending.clear()
+            self._pending_new_count = 0
             self._db.execute("DELETE FROM cache")
             self._db.commit()
 
@@ -259,12 +313,30 @@ class TranslationCacheStore(MutableMapping):
         """
         with self._lock:
             written = 0
+            valid_updates = {}
             for key, value in items:
                 safe_key = sanitize_text(str(key))
                 safe_value = sanitize_text(str(value))
                 if _entry_valid(safe_key, safe_value, self._format_re, self._is_valid):
-                    self._pending[safe_key] = safe_value
+                    valid_updates[safe_key] = safe_value
                     written += 1
+
+            unchecked = [
+                key for key in valid_updates
+                if key not in self._pending
+            ]
+            existing = set()
+            for start in range(0, len(unchecked), 500):
+                chunk = unchecked[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = self._db.execute(
+                    f"SELECT source FROM cache WHERE source IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                existing.update(row[0] for row in rows)
+
+            self._pending_new_count += len(set(unchecked) - existing)
+            self._pending.update(valid_updates)
             if sync:
                 self._flush_pending_locked()
                 self._db.commit()
@@ -437,15 +509,39 @@ def save_translation_cache(cache_file: str, cache: Mapping[str, str]) -> float:
     return time.time()
 
 
-def review_and_fix_cache(cache: Mapping[str, str], format_re, to_traditional,
-                         is_valid_translation: Callable[[str, str], bool]):
+def cache_snapshot(cache: Mapping[str, str], keys=None) -> Dict[str, str]:
+    """Read cache values once, using a store's optimized snapshot when present."""
+    snapshot = getattr(cache, 'snapshot', None)
+    if callable(snapshot):
+        return snapshot(keys)
+    if keys is None:
+        return dict(cache)
+
+    missing = object()
+    result = {}
+    for key in keys:
+        value = cache.get(key, missing)
+        if value is not missing:
+            result[key] = value
+    return result
+
+
+def review_and_fix_cache(
+        cache: Mapping[str, str], format_re, to_traditional,
+        is_valid_translation: Callable[[str, str], bool],
+        should_cancel: Optional[Callable[[], bool]] = None):
     """回傳清理後快取與 before/converted/removed 統計。"""
     before = len(cache)
     converted = 0
     removed = 0
+    cancelled = False
     new_cache: Dict[str, str] = {}
 
-    for source, translated in cache.items():
+    for index, (source, translated) in enumerate(cache.items()):
+        if (index % 512 == 0 and callable(should_cancel)
+                and should_cancel()):
+            cancelled = True
+            break
         if not isinstance(translated, str) or not translated.strip() or translated == source:
             removed += 1
             continue
@@ -469,4 +565,5 @@ def review_and_fix_cache(cache: Mapping[str, str], format_re, to_traditional,
         "converted": converted,
         "removed": removed,
         "kept": len(new_cache),
+        "cancelled": cancelled,
     }

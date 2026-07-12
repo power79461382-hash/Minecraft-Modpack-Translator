@@ -1,6 +1,8 @@
 import os
 import time
 
+from translation_cache import cache_snapshot
+
 
 def verify_translations(self, unique_strings):
     """
@@ -20,31 +22,40 @@ def verify_translations(self, unique_strings):
     # 快路徑：已在快取的（絕大多數）直接視為已翻譯，
     # 只對 miss 走完整 get_translation（字典/記憶池/變體查找）——
     # 上萬字串逐條 get_translation 會讓驗證階段卡數十秒
-    untranslated = [
-        s for s in unique_strings
-        if not self._cache_has_usable_translation(s)
-        and not self._RE_CJK_CHAR.search(s)   # 含中文=至少翻過（專有名詞刻意保留），不算失敗
-        and self.should_translate(s) and self.get_translation(s) == s
-    ]
-    # 長字串（≥15字）：句子/說明文，未翻譯較可能是 API 失敗
-    nt_long  = sorted([s for s in untranslated if len(s) >= 15],
-                      key=len, reverse=True)
-    # 短字串（<15字）：物品名/專有名詞，未翻譯較可能是刻意跳過
-    nt_short = [s for s in untranslated if len(s) < 15]
+    cached_values = cache_snapshot(self.translation_cache, unique_strings)
 
-    # ── 格式碼完整性檢查 ──
-    # 確認 §a、%s、{var} 等格式符號在翻譯後數量一致
-    fmt_issues = []
+    def cached_translation(source):
+        translated = cached_values.get(source)
+        if self._is_valid_trad_translation(source, translated):
+            return translated
+        return None
+
     def _count(lst):
         d = {}
         for x in lst: d[x] = d.get(x, 0) + 1
         return d
 
-    for s in unique_strings:
-        if not self._cache_has_usable_translation(s):
-            continue
-        t = self.translation_cache.get(s)
+    # 單次掃描同時統計 miss 與格式碼，避免十幾萬字串重複驗證。
+    untranslated = []
+    fmt_issues = []
+    for index, s in enumerate(unique_strings):
+        if index % 1024 == 0:
+            if (getattr(self, "stop_requested", False)
+                    or getattr(self, "pause_requested", False)):
+                self.log("ℹ️ 品質驗證已取消，保留目前翻譯進度。")
+                return False
+            if index:
+                update_status = getattr(self, "set_current_item", None)
+                if callable(update_status):
+                    update_status(
+                        f"階段 2.5：品質驗證 {index:,}/{total:,}...")
+
+        t = cached_translation(s)
         if t is None:
+            if (not self._RE_CJK_CHAR.search(s)
+                    and self.should_translate(s)
+                    and self.get_translation(s) == s):
+                untranslated.append(s)
             continue
         # 只比對「會影響遊戲運作」的格式碼（排除羅馬數字等裝飾性 token），
         # 與快取載入層 _critical_formats 的口徑一致，避免永遠清不掉的假警報
@@ -53,6 +64,12 @@ def verify_translations(self, unique_strings):
             continue
         if _count(orig_fmts) != _count(self._critical_format_tokens(t)):
             fmt_issues.append((s, t))
+
+    # 長字串（≥15字）：句子/說明文，未翻譯較可能是 API 失敗
+    nt_long = sorted(
+        [s for s in untranslated if len(s) >= 15], key=len, reverse=True)
+    # 短字串（<15字）：物品名/專有名詞，未翻譯較可能是刻意跳過
+    nt_short = [s for s in untranslated if len(s) < 15]
 
     # ── 輸出統計 ──
     translated_n  = total - len(untranslated)

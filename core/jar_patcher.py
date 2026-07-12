@@ -1,10 +1,18 @@
+import io
 import json
 import os
 import re
+import shutil
 import tempfile
 import zipfile
 from collections import Counter
+from contextlib import contextmanager
 from typing import Dict, Iterable, Pattern, Set, Tuple
+
+from core.analysis_scan import (
+    is_minecraft_version_root_jar,
+    java_runtime_warning_lines,
+)
 
 
 def mixin_targets_client_renderer(text: str) -> bool:
@@ -72,6 +80,38 @@ def jar_rewrite_is_high_risk(risk_reasons: Iterable[str]) -> bool:
     })
 
 
+def _strip_manifest_digest_headers(manifest: bytes) -> Tuple[bytes, bool]:
+    """Remove digest attributes and their continuation lines from a manifest."""
+    cleaned_lines = []
+    skip_continuations = False
+    removed = False
+    for line in manifest.splitlines(keepends=True):
+        if line.startswith(b' '):
+            if skip_continuations:
+                removed = True
+                continue
+            cleaned_lines.append(line)
+            continue
+
+        skip_continuations = False
+        header_name = line.split(b':', 1)[0].strip().lower()
+        is_digest_header = (
+            header_name == b'digest-algorithms'
+            or re.fullmatch(
+                rb'[a-z0-9][a-z0-9-]*-digest'
+                rb'(?:-manifest(?:-main-attributes)?)?',
+                header_name,
+                flags=re.IGNORECASE,
+            ) is not None
+        )
+        if is_digest_header:
+            skip_continuations = True
+            removed = True
+            continue
+        cleaned_lines.append(line)
+    return b''.join(cleaned_lines), removed
+
+
 def rebuild_jar_with_inject(jar_path: str, temp_jar: str,
                             inject: Dict[str, bytes],
                             jar_sig_re: Pattern[str]) -> bool:
@@ -87,13 +127,12 @@ def rebuild_jar_with_inject(jar_path: str, temp_jar: str,
             if modifies_existing and jar_sig_re.match(item.filename):
                 stripped_sig = True
                 continue
-            data_bytes = src_jar.read(item.filename)
+            data_bytes = src_jar.read(item)
             if (modifies_existing
-                    and item.filename.upper() == 'META-INF/MANIFEST.MF'
-                    and b'-Digest' in data_bytes):
-                head = re.split(rb'\r?\n\r?\n', data_bytes, 1)[0]
-                data_bytes = head + b'\r\n\r\n'
-                stripped_sig = True
+                    and item.filename.upper() == 'META-INF/MANIFEST.MF'):
+                data_bytes, removed_digests = _strip_manifest_digest_headers(
+                    data_bytes)
+                stripped_sig = stripped_sig or removed_digests
             dst_jar.writestr(item, data_bytes)
         for inj_path, inj_bytes in inject.items():
             dst_jar.writestr(inj_path, inj_bytes)
@@ -128,6 +167,199 @@ def has_paxi(mc_dir: str) -> bool:
         return False
 
 
+def find_packaged_mod_jars(archive_path: str):
+    """Return any top-level mod JAR embedded in a translation package.
+
+    Client output uses overlays only. Even a seemingly resource-only JAR is
+    rejected because it can contain nested executables or invalid metadata.
+    """
+    try:
+        with zipfile.ZipFile(archive_path, 'r') as package:
+            mod_jars = {
+                normalized
+                for info in package.infolist()
+                for normalized in (info.filename.replace('\\', '/'),)
+                if normalized.lower().startswith('mods/')
+                and normalized.lower().endswith('.jar')
+                and normalized.count('/') == 1
+            }
+    except (OSError, zipfile.BadZipFile):
+        return ['<invalid-translation-package>']
+    return sorted(mod_jars, key=lambda name: (name.casefold(), name))
+
+
+@contextmanager
+def atomic_zip_output(final_path, should_commit, validate=None, state=None):
+    """Write a ZIP beside its destination and replace only after validation."""
+    output_dir = os.path.dirname(os.path.abspath(final_path)) or os.curdir
+    os.makedirs(output_dir, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(final_path)}.",
+        suffix='.tmp',
+        dir=output_dir)
+    os.close(fd)
+    committed = False
+    if state is not None:
+        state['committed'] = False
+        state['temp_path'] = temp_path
+    try:
+        with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+            yield archive
+        if not should_commit():
+            return
+        if validate is not None and not validate(temp_path):
+            return
+        with open(temp_path, 'r+b') as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, final_path)
+        committed = True
+        if state is not None:
+            state['committed'] = True
+    finally:
+        if not committed:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+@contextmanager
+def atomic_zip_output_group(final_paths, should_commit, validate=None, state=None):
+    """Atomically replace a set of ZIPs, restoring every old file on failure."""
+    records = []
+    archives = {}
+    seen = set()
+    committed = False
+    if state is not None:
+        state['committed'] = False
+        state['temp_paths'] = []
+        state['recovery_backups'] = []
+
+    try:
+        for raw_path in final_paths:
+            final_path = os.path.abspath(raw_path)
+            canonical = os.path.normcase(final_path)
+            if canonical in seen:
+                raise ValueError(f"duplicate atomic ZIP destination: {final_path}")
+            seen.add(canonical)
+            output_dir = os.path.dirname(final_path) or os.curdir
+            os.makedirs(output_dir, exist_ok=True)
+            fd, temp_path = tempfile.mkstemp(
+                prefix=f".{os.path.basename(final_path)}.",
+                suffix='.tmp',
+                dir=output_dir)
+            os.close(fd)
+            record = {
+                'raw': raw_path,
+                'final': final_path,
+                'temp': temp_path,
+                'backup': None,
+                'preserve_backup': False,
+                'archive': zipfile.ZipFile(
+                    temp_path, 'w', zipfile.ZIP_DEFLATED),
+            }
+            records.append(record)
+            archives[raw_path] = record['archive']
+            if state is not None:
+                state['temp_paths'].append(temp_path)
+
+        try:
+            yield archives
+        finally:
+            for record in records:
+                archive = record.get('archive')
+                if archive is not None:
+                    archive.close()
+                    record['archive'] = None
+
+        if not should_commit():
+            return
+        if validate is not None:
+            for record in records:
+                if not validate(record['temp']):
+                    return
+        for record in records:
+            with open(record['temp'], 'r+b') as handle:
+                handle.flush()
+                os.fsync(handle.fileno())
+
+        # Keep copies of every previous output until all replacements succeed.
+        for record in records:
+            if not os.path.exists(record['final']):
+                continue
+            output_dir = os.path.dirname(record['final']) or os.curdir
+            fd, backup_path = tempfile.mkstemp(
+                prefix=f".{os.path.basename(record['final'])}.",
+                suffix='.bak',
+                dir=output_dir)
+            os.close(fd)
+            shutil.copy2(record['final'], backup_path)
+            record['backup'] = backup_path
+
+        replaced = []
+        try:
+            for record in records:
+                os.replace(record['temp'], record['final'])
+                record['temp'] = None
+                replaced.append(record)
+        except Exception as exc:
+            rollback_errors = []
+            for record in reversed(replaced):
+                try:
+                    if record['backup'] is not None:
+                        os.replace(record['backup'], record['final'])
+                        record['backup'] = None
+                    else:
+                        os.remove(record['final'])
+                except OSError as rollback_exc:
+                    restored_by_copy = False
+                    if record['backup'] is not None:
+                        try:
+                            shutil.copy2(record['backup'], record['final'])
+                            restored_by_copy = True
+                        except OSError as copy_exc:
+                            record['preserve_backup'] = True
+                            if state is not None:
+                                state['recovery_backups'].append(
+                                    record['backup'])
+                            rollback_errors.append(
+                                f"{rollback_exc}; copy fallback: {copy_exc}; "
+                                f"backup: {record['backup']}")
+                    else:
+                        rollback_errors.append(str(rollback_exc))
+                    if restored_by_copy:
+                        continue
+            if rollback_errors:
+                raise RuntimeError(
+                    "ZIP 群組替換失敗，且舊輸出回復不完整："
+                    + "; ".join(rollback_errors)) from exc
+            raise
+
+        committed = True
+        if state is not None:
+            state['committed'] = True
+    finally:
+        for record in records:
+            archive = record.get('archive')
+            if archive is not None:
+                try:
+                    archive.close()
+                except Exception:
+                    pass
+            for key in ('temp', 'backup'):
+                path = record.get(key)
+                if key == 'backup' and record.get('preserve_backup'):
+                    continue
+                if path:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+        if state is not None and not committed:
+            state['committed'] = False
+
+
 def split_paxi_safe_inject(inject: Dict[str, bytes]):
     """Split generated patches into safe Paxi overlays and residual JAR edits.
 
@@ -153,6 +385,98 @@ def split_paxi_safe_inject(inject: Dict[str, bytes]):
         else:
             residual[path] = payload
     return resources, data, residual
+
+
+class PaxiOverlayAccumulator:
+    """Collect overlay entries and serialize merged language JSON once."""
+
+    def __init__(self):
+        self._raw_entries: Dict[str, bytes] = {}
+        self._language_entries: Dict[str, dict] = {}
+
+    def __bool__(self):
+        return bool(self._raw_entries or self._language_entries)
+
+    def __len__(self):
+        return len(self._raw_entries) + len(self._language_entries)
+
+    def add(self, path: str, payload: bytes) -> bool:
+        normalized = path.replace('\\', '/')
+        collision = (
+            normalized in self._raw_entries
+            or normalized in self._language_entries)
+        lower = normalized.lower()
+        parsed = None
+        if '/lang/' in lower and lower.endswith('.json'):
+            try:
+                candidate = json.loads(payload.decode('utf-8-sig'))
+            except (UnicodeError, json.JSONDecodeError):
+                candidate = None
+            if isinstance(candidate, dict):
+                parsed = candidate
+
+        if parsed is not None:
+            existing = self._language_entries.get(normalized)
+            if existing is None:
+                self._language_entries[normalized] = dict(parsed)
+            else:
+                existing.update(parsed)
+            self._raw_entries.pop(normalized, None)
+            return collision
+
+        self._language_entries.pop(normalized, None)
+        self._raw_entries[normalized] = payload
+        return collision
+
+    def serialized_items(self):
+        entries = dict(self._raw_entries)
+        for path, data in self._language_entries.items():
+            entries[path] = json.dumps(
+                data, ensure_ascii=False, indent=2).encode('utf-8')
+        return sorted(entries.items())
+
+
+def merge_paxi_overlay_entry(target, path: str,
+                             payload: bytes) -> bool:
+    """Add an overlay entry, merging duplicate JSON language dictionaries."""
+    if isinstance(target, PaxiOverlayAccumulator):
+        return target.add(path, payload)
+
+    normalized = path.replace('\\', '/')
+    existing = target.get(normalized)
+    if existing is None:
+        target[normalized] = payload
+        return False
+
+    lower = normalized.lower()
+    if '/lang/' in lower and lower.endswith('.json'):
+        try:
+            old_data = json.loads(existing.decode('utf-8-sig'))
+            new_data = json.loads(payload.decode('utf-8-sig'))
+        except (UnicodeError, json.JSONDecodeError):
+            pass
+        else:
+            if isinstance(old_data, dict) and isinstance(new_data, dict):
+                old_data.update(new_data)
+                target[normalized] = json.dumps(
+                    old_data, ensure_ascii=False, indent=2).encode('utf-8')
+                return True
+
+    target[normalized] = payload
+    return True
+
+
+def build_paxi_overlay_zip(pack_format, description,
+                           overlay: PaxiOverlayAccumulator) -> bytes:
+    """Build one replaceable Paxi pack ZIP to prevent stale extracted files."""
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as pack:
+        pack.writestr(
+            'pack.mcmeta',
+            json_bytes(pack_mcmeta(pack_format, description)))
+        for path, payload in overlay.serialized_items():
+            pack.writestr(path, payload)
+    return output.getvalue()
 
 
 def patchouli_data_resource_fallback_path(path: str):
@@ -202,6 +526,7 @@ from translation_packager import (
     is_localized_manual_resource,
     translated_fallback_paths,
     translated_lang_path,
+    translated_repair_fallback_paths,
 )
 
 
@@ -218,7 +543,9 @@ def write_openloader_resource_overlay(self, combined, tmpdir, overlay_rel, injec
         overlay_zip.writestr(
             'pack.mcmeta',
             json_bytes(pack_mcmeta(
-                self.pack_format_var.get(),
+                getattr(
+                    self, '_detected_resource_pack_format',
+                    self.pack_format_var.get()),
                 "自動翻譯：高風險 JAR 安全覆蓋")))
         for path, data in overlay_inject.items():
             overlay_zip.writestr(path, data)
@@ -258,17 +585,48 @@ def build_class_inject_for_jar(self, jar_path, class_files):
     return inject
 
 def generate_class_patch_jars(self, rp_dir, rp_name, mc_dir):
-    """混合模式：語言/書本翻譯全部走資源包與資料包，
-    只有資源包覆蓋不到的 class 硬編碼字串才修補 JAR，輸出最小補丁包。"""
-    if not self.analyzed_class_texts:
-        self.log("ℹ️ 沒有偵測到需要修補的 class 硬編碼字串，免出 JAR 補丁。")
-        return
+    """Build the opt-in low-risk class/JAR patch used by hybrid mode."""
     base_name = rp_name.replace('.zip', '')
     patch_zip_path = os.path.join(rp_dir, base_name + '_Class硬編碼補丁.zip')
+
+    def remove_stale_patch():
+        try:
+            os.remove(patch_zip_path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise RuntimeError(
+                f"無法移除舊 class 補丁 {patch_zip_path}: {exc}") from exc
+
+    if bool(getattr(self, '_server_mode', False)):
+        remove_stale_patch()
+        self.log("🛡️ 伺服器模式不修改 class，已略過 class/JAR 補丁。")
+        return ""
+    if not bool(getattr(self, '_scan_class_tooltip_patch', False)):
+        remove_stale_patch()
+        self.log("ℹ️ 低風險 class/JAR 修補未啟用。")
+        return ""
+    if not self.analyzed_class_texts:
+        remove_stale_patch()
+        self.log("ℹ️ 沒有偵測到需要修補的 class 硬編碼字串，免出 JAR 補丁。")
+        return ""
     jar_count = 0
+    atomic_state = {}
+
+    def validate_patch(path):
+        try:
+            with zipfile.ZipFile(path, 'r') as package:
+                return package.testzip() is None
+        except (OSError, zipfile.BadZipFile):
+            return False
+
     self.log("\n--- 階段四：生成 class 硬編碼補丁（僅資源包覆蓋不到的字串） ---")
     with tempfile.TemporaryDirectory() as tmpdir, \
-         zipfile.ZipFile(patch_zip_path, 'w', zipfile.ZIP_DEFLATED) as combined:
+         atomic_zip_output(
+             patch_zip_path,
+             lambda: jar_count > 0 and not self.stop_requested,
+             validate=validate_patch,
+             state=atomic_state) as combined:
         for jar_path, class_files in self.analyzed_class_texts.items():
             if self.stop_requested:
                 break
@@ -276,6 +634,12 @@ def generate_class_patch_jars(self, rp_dir, rp_name, mc_dir):
             jar_rel = os.path.relpath(jar_path, mc_dir).replace('\\', '/')
             if jar_rel.startswith('..'):
                 jar_rel = 'mods/' + jar_name
+            allow_root_jar = bool(getattr(self, '_allow_root_jar', False))
+            if (not allow_root_jar
+                    and is_minecraft_version_root_jar(mc_dir, jar_path)):
+                self.log(
+                    f"  ⚠️ {jar_name}: 客戶端版本主 JAR 不可重包，已略過")
+                continue
             risk_reasons = self._jar_launch_risk_reasons(jar_path)
             if self._jar_rewrite_is_high_risk(risk_reasons):
                 self.log(
@@ -294,6 +658,7 @@ def generate_class_patch_jars(self, rp_dir, rp_name, mc_dir):
                                compress_type=zipfile.ZIP_STORED)
             except OSError as e:
                 self.log(f"  ⚠️ 備份失敗 {jar_rel}: {e}")
+                continue
             temp_jar = os.path.join(tmpdir, jar_name)
             try:
                 if self._rebuild_jar_with_inject(jar_path, temp_jar, inject):
@@ -305,18 +670,30 @@ def generate_class_patch_jars(self, rp_dir, rp_name, mc_dir):
             jar_count += 1
             self.log(f"  ✅ {jar_name}（class 修補 {len(inject)} 個檔案）")
     if jar_count and not self.stop_requested:
+        if not atomic_state.get('committed'):
+            raise RuntimeError("Class/JAR 補丁驗證失敗，舊輸出已保留")
         self.log(f"📦 Class 硬編碼補丁：{patch_zip_path}")
-        self.log(f"   解壓其中的 mods/ 覆蓋到遊戲目錄即可；原始 JAR 備份在 _backups/")
+        self.log(
+            "   解壓到遊戲實例根目錄即可；mods/ 與版本 JAR 的原檔"
+            "保存在 _backups/")
+        return patch_zip_path if atomic_state.get('committed') else ""
     elif not jar_count:
-        try:
-            os.remove(patch_zip_path)
-        except OSError:
-            pass
+        remove_stale_patch()
         self.log("ℹ️ 所有 class 硬編碼字串皆無有效翻譯，未產生 JAR 補丁。")
+    return ""
+
+def translation_package_path(rp_dir, rp_name):
+    """Build the final package name without duplicating its Chinese suffix."""
+    base_name = os.path.splitext(os.path.basename(rp_name))[0]
+    suffix = '_模組語言包'
+    if not base_name.endswith(suffix):
+        base_name += suffix
+    return os.path.join(rp_dir, base_name + '.zip')
+
 
 def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
-    base_name        = rp_name.replace('.zip', '')
-    combined_zip_path = os.path.join(rp_dir, base_name + '_模組語言包.zip')
+    base_name = os.path.splitext(os.path.basename(rp_name))[0]
+    combined_zip_path = translation_package_path(rp_dir, rp_name)
 
     total_tasks  = (
         sum(1 for lf in self.analyzed_jars.values()
@@ -342,12 +719,33 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
     openloader_available = self._has_openloader_resources(mc_dir)
     openloader_overlay_count = 0
     paxi_available = has_paxi(mc_dir)
-    paxi_resource_overlay = {}
-    paxi_data_overlay = {}
+    server_mode = bool(getattr(self, '_server_mode', False))
+    active_output_mode = getattr(
+        self, '_active_output_mode',
+        getattr(self, '_scan_output_mode', 'hybrid'))
+    direct_client_mode = not server_mode and active_output_mode == 'jar_patch'
+    client_safe_mode = not server_mode and not direct_client_mode
+    paxi_resource_overlay = PaxiOverlayAccumulator()
+    paxi_data_overlay = PaxiOverlayAccumulator()
     safe_overlay_base = re.sub(
         r'[<>:"/\\|?*\x00-\x1f]+', '_', f'{base_name}_自動翻譯覆蓋').strip(' ._')
-    paxi_resource_rel = f'config/paxi/resourcepacks/{safe_overlay_base}'
-    paxi_data_rel = f'config/paxi/datapacks/{safe_overlay_base}'
+    paxi_resource_name = safe_overlay_base + '.zip'
+    paxi_data_name = safe_overlay_base + '.zip'
+    paxi_resource_rel = f'config/paxi/resourcepacks/{paxi_resource_name}'
+    paxi_data_rel = f'config/paxi/datapacks/{paxi_data_name}'
+    resource_pack_format = getattr(
+        self, '_detected_resource_pack_format', None)
+    if resource_pack_format is None:
+        resource_pack_format = self.pack_format_var.get()
+    data_pack_format = getattr(self, '_detected_data_pack_format', None)
+    if data_pack_format is None:
+        data_format_var = getattr(self, 'datapack_format_var', None)
+        data_pack_format = (
+            data_format_var.get()
+            if data_format_var is not None
+            else resource_pack_format)
+    resource_pack_format = int(resource_pack_format)
+    data_pack_format = int(data_pack_format)
 
     def is_safe_text_resource_only(inject_map):
         """Only player-facing text resources; no class/config/recipe rewrites."""
@@ -374,19 +772,57 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
             return False
         return True
 
-    # ── 全部輸出寫入同一個合併 ZIP ──
+    atomic_state = {}
+
+    def validate_output_package(path):
+        if not client_safe_mode:
+            return True
+        unsafe_mod_jars = find_packaged_mod_jars(path)
+        if not unsafe_mod_jars:
+            return True
+        self.log(
+            "⛔ 輸出安全稽核失敗：客戶端翻譯包含禁止的 mods/*.jar："
+            + ", ".join(unsafe_mod_jars))
+        return False
+
+    # ── 全部輸出先寫同目錄暫存 ZIP，完整驗證後才原子替換 ──
     with tempfile.TemporaryDirectory() as tmpdir, \
-         zipfile.ZipFile(combined_zip_path, 'w', zipfile.ZIP_DEFLATED) as combined:
+         atomic_zip_output(
+             combined_zip_path,
+             lambda: (not self.stop_requested
+                      and (jar_count > 0 or cfg_count > 0)),
+             validate=validate_output_package,
+             state=atomic_state) as combined:
+
+        def archive_rel_path(abs_path):
+            rel_path = os.path.relpath(abs_path, mc_dir).replace('\\', '/')
+            if rel_path.startswith('..') or os.path.isabs(rel_path):
+                rel_path = os.path.join('mods', os.path.basename(abs_path)).replace('\\', '/')
+            return rel_path
+
+        def is_mod_archive_rel(rel_path):
+            normalized = rel_path.replace('\\', '/').lower()
+            return normalized.endswith('.jar') and (
+                normalized.startswith('mods/') or '/' not in normalized)
+
+        def temp_archive_path(index, rel_path):
+            ext = os.path.splitext(rel_path)[1] or '.jar'
+            safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '_', rel_path).strip(' ._')
+            if not safe_name:
+                safe_name = f'archive_{index}{ext}'
+            if not safe_name.lower().endswith(ext.lower()):
+                safe_name += ext
+            return os.path.join(tmpdir, f'{index:05d}_{safe_name}')
 
         def add_original_backup(abs_path, rel_path):
             nonlocal backup_count, skipped_large_backup_count
             if not abs_path or not os.path.exists(abs_path):
                 return
             normalized_rel = rel_path.replace('\\', '/')
-            is_jar_backup = normalized_rel.lower().endswith('.jar')
+            is_large_archive_backup = normalized_rel.lower().endswith(('.jar', '.zip'))
             include_large_backups = bool(
                 getattr(getattr(self, 'include_large_backups_var', None), 'get', lambda: False)())
-            if is_jar_backup and not include_large_backups:
+            if is_large_archive_backup and not include_large_backups:
                 skipped_large_backup_count += 1
                 return
             backup_rel = '_backups/' + normalized_rel
@@ -419,16 +855,30 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
                 if jar_path not in seen_jar_paths:
                     seen_jar_paths.add(jar_path)
                     jar_paths_to_patch.append(jar_path)
+        jar_paths_to_patch.sort(key=lambda path: (
+            archive_rel_path(path).casefold(), archive_rel_path(path)))
 
-        for jar_path in jar_paths_to_patch:
+        for archive_index, jar_path in enumerate(jar_paths_to_patch, 1):
             if self.stop_requested:
                 break
             lang_files = self.analyzed_jars.get(jar_path, {})
             jar_name = os.path.basename(jar_path)
-            jar_rel = os.path.relpath(jar_path, mc_dir).replace('\\', '/')
-            if jar_rel.startswith('..'):
-                jar_rel = os.path.join('mods', jar_name).replace('\\', '/')
-            temp_jar = os.path.join(tmpdir, jar_name)
+            jar_rel = archive_rel_path(jar_path)
+            temp_jar = temp_archive_path(archive_index, jar_rel)
+            is_mod_archive = is_mod_archive_rel(jar_rel)
+            normalized_jar_rel = jar_rel.replace('\\', '/').lower()
+            is_paxi_mod_archive = (
+                normalized_jar_rel.startswith('mods/')
+                and normalized_jar_rel.endswith('.jar'))
+
+            allow_root_jar = bool(getattr(self, '_allow_root_jar', False))
+            if (not allow_root_jar
+                    and is_minecraft_version_root_jar(mc_dir, jar_path)):
+                current_task += count_scoped_jar_tasks(jar_path, lang_files)
+                self.update_progress(current_task, total_tasks)
+                self.log(
+                    f"  ⚠️ {jar_name}: 客戶端版本主 JAR 不可重包，已略過")
+                continue
 
             risk_reasons = self._jar_launch_risk_reasons(jar_path)
             high_risk_rewrite = self._jar_rewrite_is_high_risk(risk_reasons)
@@ -444,7 +894,9 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
                            .get(jar_path, {})
                            .get(path_in_jar, {}))
                 if self.process_mode_var.get() == "force":
-                    zh_base = {}
+                    # force 模式不應丟棄 zh_cn fallback，
+                    # 只是不管 zh_tw 是否已存在都重新翻譯
+                    pass
                 else:
                     official_base = self._load_official_minecraft_zh_base(mc_dir, path_in_jar)
                     if official_base:
@@ -458,6 +910,10 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
                     merged_data = merge_structured_json_with_existing_zh(
                         lang_data, zh_base, process_book_data, self._to_traditional,
                         value_needs_update=self._lang_value_needs_update)
+                    if hasattr(self, "_repair_structured_book_json_output"):
+                        merged_data = self._repair_structured_book_json_output(
+                            lang_data, zh_base, merged_data, process_book_data,
+                            f"{jar_name}:{path_in_jar}")
                 else:
                     def process_jar_data(data, preserve=False, strict=False, _path=path_in_jar):
                         return self.process_json_data(
@@ -520,13 +976,30 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
                     break
                 if not self._scope_allows_analyzed_path("book_txt", path_in_jar):
                     continue
-                inject[path_in_jar] = safe_utf8_bytes(self.process_book_text_content(content, path_in_jar))
+                fixed_payload = safe_utf8_bytes(self.process_book_text_content(content, path_in_jar))
+                inject[path_in_jar] = fixed_payload
+                for fallback_path in translated_repair_fallback_paths(path_in_jar):
+                    inject[fallback_path] = fixed_payload
                 current_task += 1
                 self.update_progress(current_task, total_tasks)
 
             class_files = self.analyzed_class_texts.get(jar_path, {})
             if class_files:
-                if high_risk_rewrite:
+                if client_safe_mode:
+                    class_count = sum(len(strings) for strings in class_files.values())
+                    current_task += class_count
+                    self.update_progress(current_task, total_tasks)
+                    self.log(
+                        f"  🛡️ {jar_name}: 客戶端安全模式不修改任何 class；"
+                        f"{class_count} 筆硬編碼文字保留原文。")
+                elif not is_mod_archive:
+                    class_count = sum(len(strings) for strings in class_files.values())
+                    current_task += class_count
+                    self.update_progress(current_task, total_tasks)
+                    self.log(
+                        f"  🛡️ {jar_rel}: 非 mods/根目錄 JAR，跳過 class tooltip 修補，"
+                        "只輸出語言與書本資源。")
+                elif high_risk_rewrite:
                     class_count = sum(len(strings) for strings in class_files.values())
                     current_task += class_count
                     self.update_progress(current_task, total_tasks)
@@ -547,6 +1020,123 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
             if self.stop_requested or not inject:
                 continue
 
+            # Client translation must never replace executable mod archives.
+            # Paxi/OpenLoader can safely provide text resources without touching
+            # bytecode, signatures, JarJar metadata, or Mixin containers.
+            if client_safe_mode and is_mod_archive:
+                overlaid_count = 0
+                overlay_targets = []
+                if paxi_available and is_paxi_mod_archive:
+                    resource_safe, data_safe, residual = split_paxi_safe_inject(
+                        inject)
+                    for path, payload in resource_safe.items():
+                        merge_paxi_overlay_entry(
+                            paxi_resource_overlay, path, payload)
+                    for path, payload in data_safe.items():
+                        merge_paxi_overlay_entry(
+                            paxi_data_overlay, path, payload)
+                    overlaid_count = len(resource_safe) + len(data_safe)
+                    if resource_safe:
+                        overlay_targets.append(paxi_resource_rel)
+                    if data_safe:
+                        overlay_targets.append(paxi_data_rel)
+                    inject = residual
+                elif openloader_available:
+                    overlay_name = (
+                        f"{base_name}_安全資源覆蓋_"
+                        f"{os.path.splitext(jar_name)[0]}.zip")
+                    overlay_name = re.sub(
+                        r'[<>:"/\\|?*\x00-\x1f]', '_', overlay_name)
+                    overlay_rel = f"config/openloader/resources/{overlay_name}"
+                    written = self._write_openloader_resource_overlay(
+                        combined, tmpdir, overlay_rel, inject)
+                    if written:
+                        openloader_overlay_count += 1
+                        cfg_count += 1
+                        overlaid_count = written
+                        overlay_targets.append(overlay_rel)
+                        inject = {
+                            path: payload
+                            for path, payload in inject.items()
+                            if not path.replace('\\', '/').lower().startswith(
+                                'assets/')
+                        }
+
+                if overlaid_count:
+                    self.log(
+                        f"  📦 {jar_name}: {overlaid_count} 個文字資源改由"
+                        "安全覆蓋提供，原始模組 JAR 不修改。")
+                if inject:
+                    reasons = tuple(risk_reasons) or (
+                        'client-safe-no-jar-rewrite',)
+                    overlay_rel = ' + '.join(overlay_targets) or None
+                    skipped_risky_jars.append(
+                        (jar_rel, reasons, overlay_rel))
+                    self.log(
+                        f"  🛡️ {jar_name}: 客戶端安全模式禁止重包模組 JAR；"
+                        f"{len(inject)} 個無安全覆蓋通道的項目保留原文。")
+                continue
+
+            # Paxi can load assets as a normal high-priority resource pack.
+            # Keep pure language/manual changes out of source archives: this
+            # avoids rewriting hundreds of JARs and never touches their code or
+            # signatures. Advancement JSON can use a Paxi datapack; Patchouli
+            # data stays in its source archive for older-version compatibility.
+            if (not direct_client_mode
+                    and paxi_available and is_paxi_mod_archive):
+                resource_safe, data_safe, _residual = split_paxi_safe_inject(
+                    inject)
+                original_asset_paths = {
+                    path.replace('\\', '/')
+                    for path in inject
+                    if path.replace('\\', '/').lower().startswith('assets/')
+                }
+                overlay_assets = {
+                    path: payload
+                    for path, payload in resource_safe.items()
+                    if path in original_asset_paths
+                }
+                original_advancement_paths = {
+                    path.replace('\\', '/')
+                    for path in inject
+                    if (path.replace('\\', '/').lower().startswith('data/')
+                        and '/advancements/' in path.replace('\\', '/').lower()
+                        and path.replace('\\', '/').lower().endswith('.json'))
+                }
+                overlay_advancements = {
+                    path: payload
+                    for path, payload in data_safe.items()
+                    if path in original_advancement_paths
+                }
+                if overlay_assets or overlay_advancements:
+                    merged_count = 0
+                    for path, payload in overlay_assets.items():
+                        if merge_paxi_overlay_entry(
+                                paxi_resource_overlay, path, payload):
+                            merged_count += 1
+                    for path, payload in overlay_advancements.items():
+                        merge_paxi_overlay_entry(
+                            paxi_data_overlay, path, payload)
+                    offloaded_paths = (
+                        original_asset_paths | original_advancement_paths)
+                    inject = {
+                        path: payload
+                        for path, payload in inject.items()
+                        if path.replace('\\', '/') not in offloaded_paths
+                    }
+                    suffix = (f"，合併 {merged_count} 個同路徑語言檔"
+                              if merged_count else "")
+                    details = []
+                    if overlay_assets:
+                        details.append(f"assets 文字 {len(overlay_assets)}")
+                    if overlay_advancements:
+                        details.append(f"advancement {len(overlay_advancements)}")
+                    self.log(
+                        f"  📦 {jar_name}: {', '.join(details)} 個資源"
+                        f"改由 Paxi 安全覆蓋{suffix}")
+                    if not inject:
+                        continue
+
             safe_text_resource_only = is_safe_text_resource_only(inject)
             if high_risk_rewrite and safe_text_resource_only:
                 self.log(
@@ -554,12 +1144,17 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
                     "允許安全重包；仍不修改 class/config/recipe。")
                 high_risk_rewrite = False
 
-            if high_risk_rewrite and paxi_available:
+            if (high_risk_rewrite and paxi_available
+                    and is_paxi_mod_archive):
                 resource_safe, data_safe, residual = split_paxi_safe_inject(inject)
                 if resource_safe:
-                    paxi_resource_overlay.update(resource_safe)
+                    for path, payload in resource_safe.items():
+                        merge_paxi_overlay_entry(
+                            paxi_resource_overlay, path, payload)
                 if data_safe:
-                    paxi_data_overlay.update(data_safe)
+                    for path, payload in data_safe.items():
+                        merge_paxi_overlay_entry(
+                            paxi_data_overlay, path, payload)
                 if resource_safe or data_safe:
                     overlay_targets = []
                     if resource_safe:
@@ -618,11 +1213,12 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
                 continue
 
             # 將修改後的 JAR 依原始相對路徑加入合併包；
-            # mods/foo.jar 保持在 mods/，版本根目錄 JAR 保持在根目錄。
+            # mods/foo.jar 保持在 mods/，resourcepacks/datapacks ZIP/JAR 保持在原資料夾。
             combined.write(temp_jar, jar_rel,
                            compress_type=zipfile.ZIP_STORED)
             jar_count += 1
-            self.log(f"  ✅ {jar_name}（注入 {len(inject)} 個語言檔）")
+            archive_kind = "模組 JAR" if is_mod_archive else "資源/資料包"
+            self.log(f"  ✅ {jar_rel}（{archive_kind}，注入 {len(inject)} 個語言/書本檔）")
 
         # ── 散落 en_us.json（非 JAR 內）+ 附加檔案 (snbt/json/md) → 同一個合併包 ──
         written_cfg_paths = set()
@@ -740,18 +1336,72 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
         for zip_path, internal_path in self.analyzed_zip_json:
             zip_groups.setdefault(zip_path, []).append(internal_path)
 
-        for zip_path, internal_paths in zip_groups.items():
+        sorted_zip_paths = sorted(zip_groups, key=lambda path: (
+            os.path.relpath(path, mc_dir).replace('\\', '/').casefold(),
+            os.path.relpath(path, mc_dir).replace('\\', '/')))
+        for zip_path in sorted_zip_paths:
+            internal_paths = zip_groups[zip_path]
             if self.stop_requested:
                 break
             rel_path = os.path.relpath(zip_path, mc_dir).replace('\\', '/')
             temp_zip = os.path.join(tmpdir, f"patched_{len(zip_groups)}_{os.path.basename(zip_path)}")
             internal_set = set(internal_paths)
             patched_count = 0
+            normalized_rel = rel_path.lower()
+            paxi_source_kind = None
+            if paxi_available and not direct_client_mode:
+                if normalized_rel.startswith('config/paxi/resourcepacks/'):
+                    paxi_source_kind = 'resource'
+                elif normalized_rel.startswith('config/paxi/datapacks/'):
+                    paxi_source_kind = 'data'
+
+            expected_prefix = (
+                'assets/' if paxi_source_kind == 'resource' else 'data/')
+            can_offload_paxi_source = (
+                paxi_source_kind is not None
+                and all(
+                    path.replace('\\', '/').lower().startswith(expected_prefix)
+                    and path.replace('\\', '/').lower().endswith('.json')
+                    for path in internal_set
+                ))
+            if can_offload_paxi_source:
+                target_overlay = (
+                    paxi_resource_overlay
+                    if paxi_source_kind == 'resource'
+                    else paxi_data_overlay)
+                try:
+                    with zipfile.ZipFile(zip_path, 'r') as src_zip:
+                        for internal_path in sorted(internal_set):
+                            try:
+                                content = self.safe_decode_bytes(
+                                    src_zip.read(internal_path))
+                                obj = load_json_content(
+                                    content, self._clean_json_text)
+                                translated = self.process_origin_json_display_fields(obj)
+                                merge_paxi_overlay_entry(
+                                    target_overlay, internal_path,
+                                    json_bytes(translated))
+                                patched_count += 1
+                            except Exception as e:
+                                self.log(
+                                    f"  ⚠️ Paxi ZIP 內 JSON 略過 "
+                                    f"{os.path.basename(zip_path)}::{internal_path}: {e}")
+                except (OSError, zipfile.BadZipFile) as e:
+                    self.log(f"⚠️ Paxi ZIP 處理失敗 {rel_path}: {e}")
+                if patched_count:
+                    self.log(
+                        f"  📦 {os.path.basename(zip_path)}: "
+                        f"{patched_count} 個內部 JSON 改由小型 Paxi 覆蓋，"
+                        "略過來源 ZIP 重建")
+                current_task += len(internal_paths)
+                self.update_progress(current_task, total_tasks)
+                continue
+
             try:
                 with zipfile.ZipFile(zip_path, 'r') as src_zip, \
                      zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as dst_zip:
                     for item in src_zip.infolist():
-                        data = src_zip.read(item.filename)
+                        data = src_zip.read(item)
                         if item.filename in internal_set and item.filename.lower().endswith('.json'):
                             try:
                                 content = self.safe_decode_bytes(data)
@@ -772,47 +1422,98 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
             current_task += len(internal_paths)
             self.update_progress(current_task, total_tasks)
 
+        if self.scope_mod_lang_var.get():
+            synthetic_entries = {
+                'assets/mc_modpack_translator/lang/zh_tw.json':
+                    json_bytes(self.SYNTHETIC_LANG_ZH_TW),
+                'assets/additionalentityattributes/lang/zh_tw.json':
+                    json_bytes(self.ADDITIONAL_ENTITY_ATTRIBUTES_ZH_TW),
+            }
+            if direct_client_mode:
+                self.log(
+                    "📄 JAR 直接模式略過 2 個無來源模組的合成 lang；"
+                    "不產生 Paxi/資源包殘留。")
+            elif paxi_available:
+                for path, payload in synthetic_entries.items():
+                    merge_paxi_overlay_entry(
+                        paxi_resource_overlay, path, payload)
+                self.log(
+                    "📄 合成 lang 已加入 Paxi 資源覆蓋；"
+                    "不再寫入無效的遊戲根 assets/。")
+            else:
+                self.log(
+                    "🛡️ 未偵測到 Paxi，略過合成 lang 根 assets/；"
+                    "請改用資源包輸出，避免產生遊戲不會載入的檔案。")
+
+        active_paxi_files = []
+        obsolete_paxi_directories = []
         if paxi_resource_overlay:
             combined.writestr(
-                f'{paxi_resource_rel}/pack.mcmeta',
-                json_bytes(pack_mcmeta(
-                    self.pack_format_var.get(),
-                    '自動翻譯：高風險 JAR 資源覆蓋')))
-            for path, payload in sorted(paxi_resource_overlay.items()):
-                combined.writestr(f'{paxi_resource_rel}/{path}', payload)
+                paxi_resource_rel,
+                build_paxi_overlay_zip(
+                    resource_pack_format,
+                    '自動翻譯：Paxi 安全資源覆蓋',
+                    paxi_resource_overlay),
+                compress_type=zipfile.ZIP_STORED)
             cfg_count += 1
+            active_paxi_files.append(paxi_resource_rel)
+            obsolete_paxi_directories.append(
+                f'config/paxi/resourcepacks/{safe_overlay_base}')
             self.log(
                 f"📦 Paxi 資源覆蓋：{len(paxi_resource_overlay)} 個語言／書本資源")
             combined.writestr(
                 'config/paxi/resourcepack_load_order.json',
                 paxi_load_order_bytes(
-                    mc_dir, 'resourcepack_load_order.json', safe_overlay_base))
+                    mc_dir, 'resourcepack_load_order.json', paxi_resource_name))
 
         if paxi_data_overlay:
             combined.writestr(
-                f'{paxi_data_rel}/pack.mcmeta',
-                json_bytes(pack_mcmeta(
-                    self.datapack_format_var.get(),
-                    '自動翻譯：高風險 JAR 資料覆蓋')))
-            for path, payload in sorted(paxi_data_overlay.items()):
-                combined.writestr(f'{paxi_data_rel}/{path}', payload)
+                paxi_data_rel,
+                build_paxi_overlay_zip(
+                    data_pack_format,
+                    '自動翻譯：Paxi 安全資料覆蓋',
+                    paxi_data_overlay),
+                compress_type=zipfile.ZIP_STORED)
             cfg_count += 1
+            active_paxi_files.append(paxi_data_rel)
+            obsolete_paxi_directories.append(
+                f'config/paxi/datapacks/{safe_overlay_base}')
             self.log(
                 f"📦 Paxi 資料覆蓋：{len(paxi_data_overlay)} 個成就／手冊資料")
             combined.writestr(
                 'config/paxi/datapack_load_order.json',
                 paxi_load_order_bytes(
-                    mc_dir, 'datapack_load_order.json', safe_overlay_base))
+                    mc_dir, 'datapack_load_order.json', paxi_data_name))
 
-        if self.scope_mod_lang_var.get():
+        if active_paxi_files:
             combined.writestr(
-                'assets/mc_modpack_translator/lang/zh_tw.json',
-                json_bytes(self.SYNTHETIC_LANG_ZH_TW))
+                '_translator/PAXI_OVERLAY_MANIFEST.json',
+                json_bytes({
+                    'schema': 1,
+                    'active_files': active_paxi_files,
+                    'obsolete_directories': obsolete_paxi_directories,
+                }))
+            cleanup_lines = [
+                '新版翻譯覆蓋已改用單一 ZIP；之後覆蓋同名 ZIP 即可完整更新。',
+                '若曾套用舊版，請手動刪除下列同名資料夾，避免殘留翻譯：',
+                *[f'- {path}' for path in obsolete_paxi_directories],
+                '請勿刪除同層其他 Paxi 資料夾或 ZIP。',
+            ]
             combined.writestr(
-                'assets/additionalentityattributes/lang/zh_tw.json',
-                json_bytes(self.ADDITIONAL_ENTITY_ATTRIBUTES_ZH_TW))
-            cfg_count += 1
-            self.log("📄 合成 lang: assets/mc_modpack_translator/lang/zh_tw.json")
+                '_translator/PAXI_OVERLAY_CLEANUP.txt',
+                safe_utf8_bytes('\r\n'.join(cleanup_lines) + '\r\n'))
+
+        runtime_warnings = java_runtime_warning_lines(
+            getattr(self, '_java_runtime_compatibility_report', None))
+        if client_safe_mode and runtime_warnings:
+            combined.writestr(
+                'TRANSLATOR_RUNTIME_WARNING.txt',
+                safe_utf8_bytes(
+                    '\r\n'.join(line.strip() for line in runtime_warnings)
+                    + '\r\n'))
+            self.log(
+                "⚠️ Java 版本警告已寫入 TRANSLATOR_RUNTIME_WARNING.txt；"
+                "翻譯器未修改遊戲或啟動器。")
 
         if backup_count:
             combined.writestr(
@@ -831,40 +1532,58 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
                  "pause\r\n").encode('utf-8'))
 
         if skipped_risky_jars:
-            report_lines = [
-                "以下 JAR 含 Mixin/CoreMod/AccessTransformer/ModLauncher 啟動期轉換，",
-                "為避免翻譯器重包後觸發啟動崩潰，已保留原始 JAR 不修改。",
-                "若模組包有 Paxi，assets 語言/書本與 advancement/Patchouli 資料會改用安全覆蓋。",
-                "若只有 OpenLoader，assets 文字會改寫到 config/openloader/resources/。",
-                "class 硬編碼與其他高風險內容仍維持原文。",
-                "",
-            ]
+            if client_safe_mode:
+                report_name = 'SKIPPED_MOD_JAR_REWRITES.txt'
+                report_lines = [
+                    "客戶端安全模式禁止重建或覆蓋任何 mods/*.jar。",
+                    "可安全載入的 assets 與 data 文字已改用 Paxi/OpenLoader 覆蓋。",
+                    "沒有安全覆蓋通道的內容保留原文，避免遊戲啟動崩潰。",
+                    "",
+                ]
+            else:
+                report_name = 'SKIPPED_HIGH_RISK_JARS.txt'
+                report_lines = [
+                    "以下 JAR 的低風險文字資源已直接注入；啟動期高風險 class 未修改。",
+                    "若項目只有高風險 class 而無語言/書本資源，會保留原始 JAR。",
+                    "class 硬編碼與其他高風險內容仍維持原文。",
+                    "",
+                ]
             for item in skipped_risky_jars:
                 rel_path, reasons = item[0], item[1]
                 overlay_rel = item[2] if len(item) > 2 else None
                 suffix = f" -> 安全覆蓋: {overlay_rel}" if overlay_rel else " -> 已跳過"
                 report_lines.append(f"- {rel_path}  ({', '.join(reasons)}){suffix}")
             combined.writestr(
-                'SKIPPED_HIGH_RISK_JARS.txt',
+                report_name,
                 safe_utf8_bytes("\r\n".join(report_lines) + "\r\n"))
 
-    # 若無任何內容，清理空的合併包
-    if jar_count == 0 and cfg_count == 0:
-        try:
-            os.remove(combined_zip_path)
-        except OSError:
-            pass
+    if ((jar_count > 0 or cfg_count > 0)
+            and not self.stop_requested
+            and not atomic_state.get('committed')):
+        return ""
 
     if not self.stop_requested:
         if jar_count > 0 or cfg_count > 0:
             server_mode = getattr(self, "_server_mode", False)
             self.log(f"\n🎉 合併翻譯包生成完畢！")
-            self.log(f"📦 翻譯包路徑（含 mods 語言 + config + defaultconfigs）：")
+            if server_mode:
+                self.log("📦 伺服器翻譯包路徑（mods + config + defaultconfigs）：")
+            elif direct_client_mode:
+                self.log("📦 客戶端 JAR 直接翻譯包路徑（mods/JAR + config）：")
+            else:
+                self.log(
+                    "📦 客戶端安全覆蓋路徑（Paxi/OpenLoader + config；"
+                    "不含 mods/*.jar）：")
             self.log(f"   {combined_zip_path}")
             if skipped_risky_jars:
-                self.log(
-                    f"   🛡️ 已保留 {len(skipped_risky_jars)} 個啟動期高風險 JAR 原檔，"
-                    "安全文字資源已盡量改由 Paxi/OpenLoader 覆蓋；詳見報告")
+                if server_mode:
+                    self.log(
+                        f"   🛡️ 已保留 {len(skipped_risky_jars)} 個啟動期高風險 JAR 原檔，"
+                        "安全文字資源已盡量改由 Paxi/OpenLoader 覆蓋；詳見報告")
+                else:
+                    self.log(
+                        f"   🛡️ {len(skipped_risky_jars)} 個模組仍保留原始 JAR；"
+                        "無安全通道的文字保留原文，詳見報告")
             if openloader_overlay_count:
                 self.log(
                     f"   📦 已為 {openloader_overlay_count} 個高風險 JAR 產生 OpenLoader 安全覆蓋包")
@@ -879,13 +1598,22 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
                     self.log(f"   ℹ️ 已略過 {skipped_large_backup_count} 個大型 JAR 備份（可在安全增量勾選「大型 JAR 備份」啟用）")
                 self.log(f"   ④ 重新啟動伺服器 → 任務書/怪物命名/進度文字全員生效（玩家免裝補丁）")
                 self.log(f"   ℹ️ mod 介面/tooltip/死亡訊息屬客戶端範疇，請玩家另外安裝客戶端翻譯包")
+            elif direct_client_mode:
+                self.log(f"   ① 關閉遊戲與啟動器")
+                self.log(f"   ② 將 {os.path.basename(combined_zip_path)} 整包解壓到「遊戲根目錄」並覆蓋")
+                self.log("      ZIP 內含重建後 mods/*.jar、版本 JAR 與 config；不需資源包")
+                if backup_count:
+                    self.log(f"   ③ ZIP 內含 _backups/ 原始備份 {backup_count} 個，可執行 RESTORE_BACKUP.bat 還原")
+                elif skipped_large_backup_count:
+                    self.log("   ℹ️ 大型 JAR 備份未啟用；套用前請自行保留整合包副本")
+                self.log("   ④ 重啟遊戲即生效")
             else:
                 self.log(f"   將 {os.path.basename(combined_zip_path)} 解壓到「遊戲根目錄」")
-                self.log(f"   ZIP 內含 mods/、config/、defaultconfigs/ 子目錄，解壓後直接套用")
+                self.log(
+                    "   ZIP 僅含 config/defaultconfigs/Paxi/OpenLoader 安全覆蓋；"
+                    "不含 mods/*.jar，也不修改 .class")
                 if backup_count:
                     self.log(f"   ZIP 內含 _backups/ 原始備份 {backup_count} 個，可執行 RESTORE_BACKUP.bat 還原")
-                if skipped_large_backup_count:
-                    self.log(f"   已略過 {skipped_large_backup_count} 個大型 JAR 備份（可在安全增量勾選「大型 JAR 備份」啟用）")
                 self.log(f"   重啟遊戲即生效（不需啟用資源包）")
             mode_title, _ = self._output_mode_summary()
             self._last_output_path = combined_zip_path
@@ -904,5 +1632,5 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
     return combined_zip_path if (
         not self.stop_requested
         and (jar_count > 0 or cfg_count > 0)
-        and os.path.exists(combined_zip_path)
+        and atomic_state.get('committed')
     ) else ""

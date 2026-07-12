@@ -14,7 +14,7 @@ class CliModTranslatorApp(ModTranslatorApp):
         print(safe, flush=True)
 
     def _ask_proceed_from_thread(self, title, msg):
-        print(f"[CLI] {title}: {msg}", flush=True)
+        self.log(f"[CLI] {title}: {msg}")
         return True
 
     def update_progress(self, current, total, text_mode=False):
@@ -48,13 +48,18 @@ def parse_args():
     parser.add_argument("--output-dir", default=None, help="Output folder")
     parser.add_argument("--name", default="Auto_Translated_Mods_zh_tw.zip")
     parser.add_argument("--output-mode", choices=("resource_pack", "hybrid", "jar_patch"),
-                        default="hybrid")
+                        default="jar_patch")
     parser.add_argument("--dry-run", action="store_true", help="Scan only, do not translate")
     parser.add_argument("--skip-mods", action="store_true", help="Skip JAR/mod language outputs")
     parser.add_argument("--skip-quests", action="store_true", help="Skip quest/config outputs")
     parser.add_argument("--max-steps", type=int, default=-1, help="Limit analyzed file targets")
     parser.add_argument("--retry", type=int, default=None, help="Validation retry count")
-    parser.add_argument("--engine", choices=("market_ai", "google", "deepl", "azure", "claude", "openai", "local"))
+    parser.add_argument(
+        "--server-mode", action="store_true",
+        help="Explicitly allow dedicated-server JAR output (requires server.properties)")
+    parser.add_argument("--engine", choices=(
+        "market_ai", "non_ai_chain", "google", "deepl", "azure",
+        "claude", "openai", "local"))
     parser.add_argument("--provider", help="Market AI provider label, e.g. DeepSeek, Kimi / Moonshot")
     parser.add_argument("--model", help="Model id")
     parser.add_argument("--base-url", help="OpenAI-compatible base URL")
@@ -128,13 +133,16 @@ def main():
     if not os.path.isdir(output_dir):
         print(f"Output folder not found: {output_dir}", file=sys.stderr)
         return 2
+    output_name = ModTranslatorApp._safe_zip_filename(
+        args.name, "Auto_Translated_Mods_zh_tw")
 
     root = tk.Tk()
     root.withdraw()
     app = CliModTranslatorApp(root)
+    app._server_mode_requested = bool(getattr(args, "server_mode", False))
     app.mod_dir_var.set(modpack)
     app.rp_dir_var.set(output_dir)
-    app.rp_name_var.set(args.name)
+    app.rp_name_var.set(output_name)
     app.output_mode_var.set(args.output_mode)
     if args.retry is not None:
         app.retry_count_var.set(max(0, min(10, args.retry)))
@@ -174,7 +182,7 @@ def main():
         return 0
 
     pack_format = app.pack_format_var.get()
-    app._translate_task(output_dir, args.name, pack_format, args.output_mode)
+    app._translate_task(output_dir, output_name, pack_format, args.output_mode)
     root.update()
     root.destroy()
     return 0

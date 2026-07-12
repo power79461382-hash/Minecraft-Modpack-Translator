@@ -20,9 +20,11 @@ def translation_worker_limit(max_workers, primary_id, engine):
     """
     max_workers = max(1, min(32, int(max_workers or 1)))
     if primary_id == 'bing':
-        return min(max_workers, 24)
+        return min(max_workers, 4)
     if primary_id == 'gtx':
         return min(max_workers, 8)
+    if primary_id == 'azure':
+        return min(max_workers, 5)
     if primary_id in ('mymemory', 'libretranslate'):
         return min(max_workers, 4)
     if engine in ('claude', 'openai', 'market_ai', 'local'):
@@ -30,7 +32,27 @@ def translation_worker_limit(max_workers, primary_id, engine):
     return max_workers
 
 
-def translation_fallback_order(engine, primary_id, ai_provider_key=None):
+def engine_concurrency_limit(max_workers, engine_id):
+    """Cap provider fan-out independently from the selected primary route."""
+    max_workers = max(1, int(max_workers or 1))
+    if engine_id == 'azure':
+        return min(max_workers, 5)
+    if engine_id == 'gtx':
+        return min(max_workers, 8)
+    if engine_id == 'bing':
+        return min(max_workers, 4)
+    return max_workers
+
+
+def translation_wait_budget(engine_route, strict_paid_primary):
+    """Return the per-chunk cumulative cooldown budget in seconds."""
+    if engine_route == 'non_ai_chain' and not strict_paid_primary:
+        return 45
+    return 300
+
+
+def translation_fallback_order(engine, primary_id, ai_provider_key=None,
+                               azure_available=None):
     """Return fallback route order after the selected primary engine.
 
     Non-AI mode uses Bing, Azure, and GTX in priority order. A throttled engine
@@ -38,12 +60,17 @@ def translation_fallback_order(engine, primary_id, ai_provider_key=None):
     """
     if primary_id == "market_ai" and ai_provider_key in (
             "deepseek_v4_flash_free", "openrouter_free_router", "openrouter_free_models", "openrouter"):
-        return ['bing', 'azure', 'gtx', 'libretranslate', 'google_api']
-    if engine == "non_ai_chain":
-        return ['bing', 'azure', 'gtx']
-    if engine != "non_ai_chain" and primary_id in ("market_ai", "openai", "claude", "google_api", "azure", "deepl"):
-        return ['bing', 'azure', 'gtx']
-    return ['bing', 'azure', 'gtx', 'libretranslate', 'google_api']
+        order = ['bing', 'azure', 'gtx', 'libretranslate', 'google_api']
+    elif engine == "non_ai_chain":
+        order = ['bing', 'azure', 'gtx']
+    elif engine != "non_ai_chain" and primary_id in (
+            "market_ai", "openai", "claude", "google_api", "azure", "deepl"):
+        order = ['bing', 'azure', 'gtx']
+    else:
+        order = ['bing', 'azure', 'gtx', 'libretranslate', 'google_api']
+    if azure_available is False:
+        order = [engine_id for engine_id in order if engine_id != 'azure']
+    return order
 
 
 def engine_rate_limit_cooldown(engine_route, engine_id, retry_after):
@@ -127,6 +154,16 @@ def likely_bing_passthrough(text):
         return len(words[0]) >= 3
     title_words = sum(1 for word in words if word[0].isupper() or word.isupper())
     return title_words / len(words) >= 0.65
+
+
+def _translation_result_is_complete(source_items, translated_items):
+    """Return whether a provider produced one non-blank string per input."""
+    return (
+        isinstance(translated_items, (list, tuple))
+        and len(translated_items) == len(source_items)
+        and all(isinstance(item, str) and item.strip()
+                for item in translated_items)
+    )
 
 
 def interruptible_sleep(should_stop, seconds, quantum=0.2):
@@ -320,7 +357,9 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
     pool_ids = [primary_id]
     backup_ids = []
     # Argos（離線庫未隨 EXE 打包，永遠不可用）已移除。
-    fallback_order = translation_fallback_order(engine, primary_id, ai_provider_key)
+    fallback_order = translation_fallback_order(
+        engine, primary_id, ai_provider_key,
+        azure_available=bool(azure_key))
 
     for eid in fallback_order:
         if eid not in pool_ids and ALL_FN.get(eid):
@@ -337,7 +376,8 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
         missing_strings, engine, primary_id, ai_model, _force_chunk_size)
     routed_chunks = [(chunk, _preferred_engine) for chunk in chunks]
     if engine == "non_ai_chain" and primary_id == "bing":
-        self.log("⚡ 非 AI 翻譯鏈：Bing 優先吃滿；限流才切 Azure → GTX")
+        chain = " → ".join(ENG_LABEL.get(eid, eid) for eid in pool_ids)
+        self.log(f"⚡ 非 AI 翻譯鏈：{chain}；限流自動切換")
     if _preferred_engine:
         self.log(f"↪️ 重試批次優先使用 {ENG_LABEL.get(_preferred_engine, _preferred_engine)}")
     chunk_size = max((len(chunk) for chunk, _preferred in routed_chunks), default=1)
@@ -390,10 +430,17 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
                 and throttle_until.get(e, 0.0) <= now
             ]
 
-    def _throttle(eng, sec):
-        sec = engine_rate_limit_cooldown(engine, eng, sec)
+    def _throttle(eng, sec, *, rate_limited=False, announce=True):
+        try:
+            sec = max(1.0, float(sec))
+        except (TypeError, ValueError):
+            sec = 30.0
+        if rate_limited:
+            sec = engine_rate_limit_cooldown(engine, eng, sec)
         with eng_lock:
-            throttle_until[eng] = time.time() + sec
+            deadline = time.time() + sec
+            throttle_until[eng] = max(
+                throttle_until.get(eng, 0.0), deadline)
             locked_to_paid_primary = strict_paid_primary and eng == primary_id and not backup_activated[0]
             now = time.time()
             has_ready_alternative = any(
@@ -406,13 +453,35 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
         if adaptive_controller is not None:
             if locked_to_paid_primary or not has_ready_alternative:
                 new_workers = adaptive_controller.on_rate_limit(sec)
-                self.log(f"🐢 自適應限流：有效並發降為 {new_workers}")
+                cause = "限流" if rate_limited else "暫時錯誤"
+                self.log(f"🐢 自適應{cause}：有效並發降為 {new_workers}")
             else:
-                self.log(f"🚀 {ENG_LABEL.get(eng, eng)} 限流，但已有下一個引擎可用；維持目前並發")
+                cause = "限流" if rate_limited else "暫時冷卻"
+                self.log(
+                    f"🚀 {ENG_LABEL.get(eng, eng)} {cause}，"
+                    "但已有下一個引擎可用；維持目前並發")
+        if not announce:
+            return
+        if not rate_limited:
+            if locked_to_paid_primary:
+                self.log(
+                    f"⚠️ {ENG_LABEL.get(eng, eng)} 暫時冷卻 {sec:.0f}s "
+                    "→ 付費主 API 等待後重試")
+            else:
+                self.log(
+                    f"↪️ {ENG_LABEL.get(eng, eng)} 暫時冷卻 {sec:.0f}s "
+                    "→ 自動切換下一個引擎...")
+            return
         if locked_to_paid_primary:
             self.log(f"⚠️ {ENG_LABEL.get(eng, eng)} 限流 {sec:.0f}s → 付費主 API 仍可用，等待後重試，不切換備援")
+        elif has_ready_alternative:
+            self.log(
+                f"⚠️ {ENG_LABEL.get(eng, eng)} HTTP 429；"
+                f"僅冷卻此引擎 {sec:.0f}s，立即切換下一個，不中斷翻譯")
         else:
-            self.log(f"⚠️ {ENG_LABEL.get(eng, eng)} 限流 {sec:.0f}s → 自動切換下一個引擎...")
+            self.log(
+                f"⚠️ {ENG_LABEL.get(eng, eng)} HTTP 429；"
+                f"目前無可用備援，冷卻 {sec:.0f}s 後重試")
 
     def _disable(eng, reason):
         with eng_lock:
@@ -442,7 +511,7 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
             "http 500", "http 502", "http 503", "http 504",
             "service unavailable", "temporarily unavailable",
             "connection", "timeout", "timed out", "連線失敗",
-            "network", "max retries",
+            "network", "max retries", "incomplete translation response",
         ))
 
     # 顯示引擎池資訊
@@ -460,8 +529,45 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
     if workers != max_workers:
         self.log(f"⚙️ 翻譯並發：{workers}/{max_workers}（主引擎：{ENG_LABEL.get(primary_id, primary_id)}）")
     adaptive_controller = AdaptiveConcurrency(workers, minimum=1, maximum=workers)
+    engine_gates = {
+        engine_id: threading.BoundedSemaphore(
+            engine_concurrency_limit(workers, engine_id))
+        for engine_id in dispatch
+    }
+    _ENGINE_RESELECT = object()
+
+    def _dispatch_with_limit(engine_id, payload):
+        gate = engine_gates[engine_id]
+        while not self.stop_requested:
+            if not gate.acquire(timeout=0.2):
+                continue
+            try:
+                # A queued worker may have selected this provider before another
+                # request throttled or disabled it. Re-select instead of sending
+                # the rest of the queued burst into the same cooldown window.
+                with eng_lock:
+                    unavailable = (
+                        engine_id in disabled_engines
+                        or engine_id in inactive_backups
+                        or throttle_until.get(engine_id, 0.0) > time.time()
+                    )
+                if unavailable:
+                    return None, _ENGINE_RESELECT
+                return dispatch[engine_id](payload)
+            finally:
+                gate.release()
+        return None, _ENGINE_RESELECT
+
+    def _incomplete_result_error(eng):
+        prefix = ("DISABLED:" if strict_paid_primary and eng == primary_id
+                  else "ERR:")
+        return (f"{prefix}{ENG_LABEL.get(eng, eng)} "
+                "incomplete translation response")
 
     def process_chunk_smart(chunk_data, preferred_engine=None):
+        _MAX_CUMULATIVE_WAIT = translation_wait_budget(
+            engine, strict_paid_primary)
+        _cumulative_wait = 0.0
         for _ in range(60):
             if self.stop_requested:
                 return chunk_data, None, None
@@ -469,7 +575,11 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
             if eng is None:
                 if wait == -1:
                     return chunk_data, None, "所有翻譯引擎已停用（額度耗盡或 Key 無效），略過此批次"
-                self.log(f"⏳ 所有引擎限流，等待 {wait:.0f}s...")
+                if _cumulative_wait + wait > _MAX_CUMULATIVE_WAIT:
+                    self.log(f"⏱️ 累計等待已達 {_cumulative_wait:.0f}s 上限，放棄此批次")
+                    return chunk_data, None, f"所有引擎持續限流超過 {_MAX_CUMULATIVE_WAIT}s，略過此批次"
+                _cumulative_wait += wait
+                self.log(f"⏳ 所有引擎限流，等待 {wait:.0f}s...（累計 {_cumulative_wait:.0f}s/{_MAX_CUMULATIVE_WAIT}s）")
                 if not interruptible_sleep(
                         lambda: self.stop_requested,
                         wait + random.uniform(0, 1)):
@@ -483,8 +593,13 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
                 masked_chunk.append(m)
                 mappings.append(mp)
             request_started = time.monotonic()
-            trans, err = dispatch[eng](masked_chunk)
+            trans, err = _dispatch_with_limit(eng, masked_chunk)
             request_elapsed = time.monotonic() - request_started
+            if err is _ENGINE_RESELECT:
+                continue
+            if err is None and not _translation_result_is_complete(
+                    chunk_data, trans):
+                err = _incomplete_result_error(eng)
             if err is None:
                 # 成功 → 清除此引擎的連續錯誤計數
                 with eng_lock:
@@ -500,7 +615,7 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
                         self.log(
                             f"🐢 {ENG_LABEL.get(eng, eng)} 回應過慢"
                             f"（約 {rate:.1f} 詞/秒）→ 冷卻 {soft_cooldown:.0f}s，切換下一個引擎")
-                        _throttle(eng, soft_cooldown)
+                        _throttle(eng, soft_cooldown, announce=False)
                         with eng_lock:
                             slow_success_counts[eng] = 0
                 else:
@@ -540,14 +655,20 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
                             nxt = candidates[0]
                             tried.add(nxt)
                             hops += 1
-                            sub_trans, sub_err = dispatch[nxt](
+                            sub_trans, sub_err = _dispatch_with_limit(
+                                nxt,
                                 [masked_chunk[i] for i in retry_idx])
+                            if sub_err is _ENGINE_RESELECT:
+                                continue
                             if sub_err or not sub_trans:
                                 if sub_err and sub_err.startswith("429:"):
                                     try:
-                                        _throttle(nxt, float(sub_err[4:]))
+                                        _throttle(
+                                            nxt, float(sub_err[4:]),
+                                            rate_limited=True)
                                     except ValueError:
-                                        _throttle(nxt, 30.0)
+                                        _throttle(
+                                            nxt, 30.0, rate_limited=True)
                                 elif sub_err and sub_err.startswith("DISABLED:"):
                                     _disable(nxt, sub_err[9:])
                                 continue
@@ -571,30 +692,47 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
                 merged = []
                 split_ok = True
                 for lo, hi in ((0, mid), (mid, len(chunk_data))):
-                    sub_trans, sub_err = dispatch[eng](masked_chunk[lo:hi])
-                    if sub_err or not sub_trans:
+                    sub_chunk = chunk_data[lo:hi]
+                    sub_trans, sub_err = _dispatch_with_limit(
+                        eng, masked_chunk[lo:hi])
+                    if sub_err is _ENGINE_RESELECT:
+                        split_ok = False
+                        err = _ENGINE_RESELECT
+                        break
+                    if sub_err:
+                        err = sub_err
+                        split_ok = False
+                        break
+                    if not _translation_result_is_complete(
+                            sub_chunk, sub_trans):
+                        err = _incomplete_result_error(eng)
                         split_ok = False
                         break
                     merged.extend(sub_trans)
-                if split_ok and len(merged) == len(chunk_data):
+                if split_ok and _translation_result_is_complete(
+                        chunk_data, merged):
                     with eng_lock:
                         error_counts[eng] = 0
                     trans = [self._unmask_format(t, mp)
                              for t, mp in zip(merged, mappings)]
                     return chunk_data, trans, None
+                if err is _ENGINE_RESELECT:
+                    continue
                 # 切批仍失敗 → 落回一般錯誤處理（冷卻/計數）
-            elif timeout_err:
+            elif (timeout_err
+                  and not (strict_paid_primary and eng == primary_id)):
                 wait_seconds = 8.0 if eng == "bing" else 12.0 if eng == "azure" else 20.0
                 self.log(f"⏱️ {ENG_LABEL.get(eng, eng)} 批次逾時 → "
                          f"冷卻 {wait_seconds:.0f}s 並切換下一個引擎")
-                _throttle(eng, wait_seconds)
+                _throttle(eng, wait_seconds, announce=False)
                 continue
 
             if err.startswith("429:"):
                 try:
-                    _throttle(eng, float(err[4:]))
+                    _throttle(
+                        eng, float(err[4:]), rate_limited=True)
                 except ValueError:
-                    _throttle(eng, 30.0)
+                    _throttle(eng, 30.0, rate_limited=True)
                 continue
             if err.startswith("DISABLED:"):
                 if strict_paid_primary and eng == primary_id:
@@ -614,27 +752,32 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
                         failures = error_counts[eng]
                     if failures >= 3:
                         _activate_backups(reason)
-                        _disable(eng, reason)
+                        cooldown = min(60.0, 20.0 * failures)
+                        self.log(
+                            f"⚠️ {ENG_LABEL.get(eng, eng)} 暫時性錯誤"
+                            f"（連續 {failures} 次）：{reason} → 已啟用備援，"
+                            f"冷卻 {cooldown:.0f}s 後自動恢復探測")
+                        _throttle(eng, cooldown, announce=False)
                     else:
                         self.log(f"⚠️ {ENG_LABEL.get(eng, eng)} 暫時性錯誤"
                                  f"（{failures}/3）：{reason} → 冷卻 20s 後重試")
-                        _throttle(eng, 20.0)
+                        _throttle(eng, 20.0, announce=False)
                     continue
                 return chunk_data, None, err
-            # 暫時性錯誤（非限流、非停用）→ 先冷卻重試，連續 3 次才停用，
-            # 避免單次網路抖動把整場任務永久降級到慢速保底引擎
+            # 暫時性錯誤只開啟有期限的熔斷。只有供應商明確回傳
+            # DISABLED 才能在整場任務停用，避免短暫網路故障永久降級。
             with eng_lock:
                 # 同一波抖動的並行失敗不重複計數（引擎已在冷卻中）
                 if time.time() < throttle_until.get(eng, 0.0):
                     continue
                 error_counts[eng] += 1
                 failures = error_counts[eng]
-            if failures >= 3:
-                _disable(eng, err.lstrip("ERR:"))
-            else:
-                self.log(f"⚠️ {ENG_LABEL.get(eng, eng)} 暫時性錯誤"
-                         f"（{failures}/3）：{err.lstrip('ERR:')[:60]} → 冷卻 15s 後換下一引擎重試")
-                _throttle(eng, 15.0)
+            cooldown = min(60.0, 15.0 * max(1, failures))
+            self.log(
+                f"⚠️ {ENG_LABEL.get(eng, eng)} 暫時性錯誤"
+                f"（連續 {failures} 次）：{err.lstrip('ERR:')[:60]} → "
+                f"冷卻 {cooldown:.0f}s 後自動恢復探測")
+            _throttle(eng, cooldown, announce=False)
             continue
         return chunk_data, None, "所有引擎重試均失敗，略過此批次"
 
@@ -717,18 +860,23 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
                     bulk_update = getattr(self.translation_cache, "bulk_update", None)
                     if callable(bulk_update):
                         try:
-                            translated_count = bulk_update(changed_pairs, sync=False)
+                            bulk_update(changed_pairs, sync=False)
                         except TypeError:
-                            translated_count = bulk_update(changed_pairs)
+                            bulk_update(changed_pairs)
                     else:
                         for orig, validated in changed_pairs:
                             self.translation_cache[orig] = validated
-                            translated_count += 1
-                    if translated_count > 0:
+                    accepted_pairs = [
+                        (orig, validated)
+                        for orig, validated in changed_pairs
+                        if self.translation_cache.get(orig) == validated
+                    ]
+                    translated_count = len(accepted_pairs)
+                    if accepted_pairs:
                         self._session_translated_keys = getattr(
                             self, "_session_translated_keys", set())
                         self._session_translated_keys.update(
-                            orig for orig, _ in changed_pairs)
+                            orig for orig, _ in accepted_pairs)
                 processed_count = len(chunk_data) if chunk_data else 0
                 skipped_count = max(0, processed_count - translated_count)
                 if self.stop_requested:
@@ -771,6 +919,7 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
                         eta_str = ""
                     self.log(f"{ENG_LABEL.get(cur, cur)} [{done}/{total}]{eta_str} (例: {sample}...)")
                 self._maybe_save_cache()
-                submit_until_limit()
                 if self.stop_requested:
                     break
+            if not self.stop_requested:
+                submit_until_limit()

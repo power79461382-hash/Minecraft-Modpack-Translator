@@ -5,6 +5,9 @@ import time
 import tkinter as tk
 import zipfile
 
+from core.analysis_scan import java_runtime_warning_lines
+from core.jar_patcher import atomic_zip_output_group
+from translation_cache import cache_snapshot
 from translation_packager import (
     defaultconfigs_mirror_path,
     ftbq_lang_snbt_role,
@@ -21,7 +24,40 @@ from translation_packager import (
     safe_utf8_bytes,
     translated_fallback_paths,
     translated_lang_path,
+    translated_repair_fallback_paths,
 )
+
+
+POST_TRANSLATION_RESCUE_LIMIT = 500
+
+
+def confirm_java_runtime_before_translation(app):
+    """Require explicit confirmation after an incompatible launcher runtime."""
+    report = getattr(app, '_java_runtime_compatibility_report', None)
+    if not isinstance(report, dict) or not report.get('is_incompatible'):
+        return True
+
+    warning_lines = [
+        line.strip() for line in java_runtime_warning_lines(report)
+        if line.strip()
+    ]
+    warning_lines.extend((
+        "",
+        "請先到 PCL 的此版本設定，將 Java 改為上列 Java 17。",
+        "完成設定後才按「是」；按「否」會取消本次翻譯輸出。",
+    ))
+    ask = getattr(app, '_ask_proceed_from_thread', None)
+    if not callable(ask):
+        app.log("⛔ Java 版本不相容且無法取得確認，已取消翻譯。")
+        return False
+    confirmed = bool(ask(
+        "Java 版本錯誤：先切換至 Java 17",
+        '\n'.join(warning_lines)))
+    if confirmed:
+        app.log("✅ 已確認啟動器改用 Java 17，繼續翻譯。")
+    else:
+        app.log("⛔ 尚未確認切換 Java 17，已取消本次翻譯。")
+    return confirmed
 
 
 def save_post_batch_checkpoint(app):
@@ -30,16 +66,73 @@ def save_post_batch_checkpoint(app):
     return not (app.stop_requested or app.pause_requested)
 
 
+def usable_cache_translation_keys(app, strings):
+    """Return keys with valid cached translations using one bulk read."""
+    snapshot = cache_snapshot(app.translation_cache, strings)
+    validator = getattr(app, '_is_valid_trad_translation', None)
+    if not callable(validator):
+        fallback = getattr(app, '_cache_has_usable_translation')
+        return {source for source in snapshot if fallback(source)}
+    return {
+        source for source, translated in snapshot.items()
+        if validator(source, translated)
+    }
+
+
+def remove_legacy_client_class_patch(app, output_dir, output_name):
+    """Remove an executable class patch left by unsafe older releases."""
+    base_name = output_name.replace('.zip', '')
+    legacy_path = os.path.join(
+        output_dir, base_name + '_Class硬編碼補丁.zip')
+    try:
+        os.remove(legacy_path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RuntimeError(
+            f"無法移除舊版危險 Class 補丁：{legacy_path}: {exc}") from exc
+    app.log(f"🛡️ 已移除舊版危險 Class 補丁：{legacy_path}")
+    return True
+
+
 def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patch"):
     output_mode = output_mode if output_mode in ("resource_pack", "hybrid", "jar_patch") else "hybrid"
+    self._active_output_mode = output_mode
+    pack_format = int(getattr(
+        self, '_detected_resource_pack_format', pack_format))
     mc_dir = self.analyzed_mc_dir          # 使用分析時的根目錄，確保 rel_path 正確
     task_started_at = time.time()
     task_completed = False
     task_cancelled = False
     task_error = False
     output_path = ""
+
+    def checkpoint_cancelled():
+        nonlocal task_cancelled
+        if not (self.stop_requested or self.pause_requested):
+            return False
+        task_cancelled = True
+        self.save_cache(light=True)
+        if self.pause_requested:
+            self.log("⏸️ 已暫停並儲存進度。下次直接點「開始極速翻譯」即可接續！")
+        else:
+            self.log("🛑 處理已中斷。")
+        return True
+
     try:
+        if not confirm_java_runtime_before_translation(self):
+            task_cancelled = True
+            self._set_summary_card(
+                "pending", "已取消",
+                "Java 版本不相容：請先在 PCL 固定 Java 17",
+                self.C_WARN)
+            return
+
+        previous_cache = getattr(self, "translation_cache", None)
+        if hasattr(previous_cache, "close"):
+            previous_cache.close()
         self.translation_cache = self.load_cache()
+        self._last_light_len = -1
         self.translation_dictionary = {}
         self.last_save_time    = time.time()
 
@@ -70,12 +163,20 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
         # 不要在翻譯開始前把全域記憶池命中逐筆寫入 shelve 快取。
         # 38k 詞彙、1w+ 記憶池命中會變成大量磁碟隨機寫入，導致第一階段長時間卡住。
         # 輸出時 get_translation() 已會讀取記憶池，所以這裡只做集合比對。
+        # force 模式仍使用記憶池和快取作為 fallback：翻譯引擎未翻到的字串，
+        # 輸出時會從快取/記憶池取回，避免產生未翻譯的輸出。
         cache_keys = set() if force_mode else set(self.translation_cache.keys())
-        memory = self._load_translation_memory() if self.global_memory_var.get() and not force_mode else {}
+        memory = self._load_translation_memory() if self.global_memory_var.get() else {}
         memory_keys = set(memory.keys()) if memory else set()
-        cache_hit_strings = unique_strings & cache_keys
-        memory_hit_strings = (unique_strings - cache_hit_strings) & memory_keys
-        missing_strings = sorted(unique_strings - cache_hit_strings - memory_hit_strings)
+        if force_mode:
+            cache_hit_strings = set()
+            memory_hit_strings = set()
+            missing_strings = sorted(unique_strings)
+        else:
+            cache_hit_strings = unique_strings & cache_keys
+            memory_hit_strings = (unique_strings - cache_hit_strings) & memory_keys
+            missing_strings = sorted(
+                unique_strings - cache_hit_strings - memory_hit_strings)
         cache_hits = len(cache_hit_strings) + len(memory_hit_strings)
         self._analysis_total_strings = len(unique_strings)
         self._analysis_cache_hits = cache_hits
@@ -116,9 +217,14 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
         for attempt in range(1, retry_count + 1):
             if self.stop_requested:
                 break
+            usable_keys = (
+                set(self._session_translated_keys)
+                if force_mode
+                else usable_cache_translation_keys(self, unique_strings)
+            )
             still_missing = [s for s in unique_strings
-                             if not self._cache_has_usable_translation(s)
-                             and s not in memory_keys
+                             if s not in usable_keys
+                             and (force_mode or s not in memory_keys)
                              and not self._RE_CJK_CHAR.search(s)   # 混中英=已翻過，重試浪費配額
                              and self.should_translate(s)]
             if not still_missing:
@@ -171,39 +277,82 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
         # 含格式碼的標題/長句（任務書/裝備 tooltip）整句送翻時，引擎常弄壞 [#N#] 遮罩
         # 而被驗證退回。改成按格式碼切段、只翻純文字段、碼原樣保留：
         # 格式碼與 %s 完全不經過引擎，組裝結果結構上不可能壞 → 零崩潰風險。
-        if not self.stop_requested:
-            heavy = [s for s in unique_strings
-                     if not self._cache_has_usable_translation(s)
-                     and not self._RE_CJK_CHAR.search(s)
-                     and self.should_translate(s)
-                     and self._RE_FORMAT.search(s)]
+        rescue_budget = POST_TRANSLATION_RESCUE_LIMIT if retry_count > 0 else 0
+
+        def run_bounded_rescue(callback, candidates):
+            nonlocal rescue_budget
+            before = rescue_budget
+            self._post_translation_rescue_budget = before
+            self._post_translation_rescue_budget_managed = False
+            try:
+                return callback(candidates)
+            finally:
+                if self._post_translation_rescue_budget_managed:
+                    rescue_budget = max(
+                        0, min(before, int(
+                            self._post_translation_rescue_budget)))
+                else:
+                    # Test doubles and older integrations may not implement the
+                    # engine-item budget. Count their source rows conservatively.
+                    rescue_budget = max(0, before - len(candidates))
+                del self._post_translation_rescue_budget
+                del self._post_translation_rescue_budget_managed
+
+        if retry_count == 0:
+            self.log("ℹ️  驗證重試設為 0；略過階段二.七、二.八補翻，直接生成輸出。")
+        if not self.stop_requested and rescue_budget > 0:
+            usable_keys = usable_cache_translation_keys(self, unique_strings)
+            heavy = sorted(
+                s for s in unique_strings
+                if s not in usable_keys
+                and (force_mode or s not in memory_keys)
+                and not self._RE_CJK_CHAR.search(s)
+                and self.should_translate(s)
+                and self._RE_FORMAT.search(s)
+            )
             if heavy:
-                self.log(f"\n--- 階段二.七：格式字串分段補翻（{len(heavy)} 筆） ---")
-                rescued = self._retry_segment_mode(heavy)
+                selected = heavy[:rescue_budget]
+                omitted = len(heavy) - len(selected)
+                self.log(f"\n--- 階段二.七：格式字串分段補翻（{len(selected)} 筆） ---")
+                if omitted:
+                    self.log(
+                        f"ℹ️  補翻共用上限 {POST_TRANSLATION_RESCUE_LIMIT} 筆；"
+                        f"另 {omitted} 筆保留原文，避免完成後長時間卡住。")
+                rescued = run_bounded_rescue(
+                    self._retry_segment_mode, selected)
                 if rescued:
                     self.save_cache(light=True)
 
         # ── 階段二.八：混英譯文補翻（AI 引擎才有能力翻自創詞） ──
-        if not self.stop_requested:
-            mixed = self._find_mixed_translations(unique_strings)
+        if not self.stop_requested and rescue_budget > 0:
+            mixed = sorted(self._find_mixed_translations(unique_strings))
             if mixed:
+                selected = list(mixed[:rescue_budget])
+                omitted = len(mixed) - len(selected)
+                if omitted:
+                    self.log(
+                        f"ℹ️  補翻共用上限 {POST_TRANSLATION_RESCUE_LIMIT} 筆；"
+                        f"另 {omitted} 筆保留原文，避免完成後長時間卡住。")
                 engine_route = self._normalize_engine_route_value(self.engine_var.get())
                 if engine_route in ('market_ai', 'claude', 'openai', 'local'):
-                    self.log(f"\n--- 階段二.八：混英譯文補翻（{len(mixed)} 筆，"
+                    self.log(f"\n--- 階段二.八：混英譯文補翻（{len(selected)} 筆，"
                              f"如「Brightsteel 板」→「亮鋼板」） ---")
-                    if self._retranslate_mixed(mixed):
+                    if run_bounded_rescue(
+                            self._retranslate_mixed, selected):
                         self.save_cache(light=True)
                 else:
-                    self.log(f"\n--- 階段二.八：混英片語升級（{len(mixed)} 筆，非 AI 鏈） ---")
-                    if self._upgrade_mixed_phrases(mixed):
+                    self.log(f"\n--- 階段二.八：混英片語升級（{len(selected)} 筆，非 AI 鏈） ---")
+                    if run_bounded_rescue(
+                            self._upgrade_mixed_phrases, selected):
                         self.save_cache(light=True)
                     self.log(f"💡 非 AI 升級為逐片語翻譯；想要整句更通順的版本，"
                              f"可切「市面 AI 模型」再跑一次。")
 
         if not self.stop_requested:
+            usable_keys = usable_cache_translation_keys(self, unique_strings)
             still_missing_final = [
                 s for s in unique_strings
-                if not self._cache_has_usable_translation(s) and s not in memory_keys
+                if s not in usable_keys and s not in memory_keys
             ]
             if still_missing_final:
                 self.log(f"ℹ️  仍有 {len(still_missing_final)} 筆字串無法翻譯"
@@ -228,22 +377,21 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
                 self.save_cache(light=True)
                 return
 
-        if self.stop_requested:
-            task_cancelled = True
-            # 中斷路徑只快速同步進度；完整繁體複查與記憶池整理留到正常完成時。
-            # 否則停止／暫停會在數萬筆快取上再跑一次昂貴收尾，看起來像卡死。
-            self.save_cache(light=True)
-            if self.pause_requested:
-                self.log("⏸️ 已暫停並儲存進度。下次直接點「開始極速翻譯」即可接續！")
-            else:
-                self.log("🛑 處理已中斷。")
+        if checkpoint_cancelled():
             return
 
         # ── 階段 2.5：快取繁體複查 + 翻譯品質驗證 ──
         phase25_start = time.time()
         self.set_current_item("階段 2.5：快取複查與品質驗證...", force=True)
+        if checkpoint_cancelled():
+            return
         self._review_and_fix_cache()
-        if not self._verify_translations(unique_strings):
+        if checkpoint_cancelled():
+            return
+        verified = self._verify_translations(unique_strings)
+        if checkpoint_cancelled():
+            return
+        if not verified:
             task_cancelled = True
             self._set_summary_card(
                 "pending", "已取消",
@@ -251,20 +399,32 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
                 self.C_WARN)
             return   # 使用者取消輸出
         self.log(f"⏱️ 階段 2.5 完成：{time.time() - phase25_start:.1f} 秒")
+        usable_keys = usable_cache_translation_keys(self, unique_strings)
         final_missing = len([
             s for s in unique_strings
-            if not self._cache_has_usable_translation(s) and s not in memory_keys
+            if s not in usable_keys and s not in memory_keys
         ])
         self._set_summary_card(
             "pending", f"{final_missing:,}",
             f"總計：{len(unique_strings):,}\n狀態：輸出中",
             self.C_WARN if final_missing else self.C_SUCCESS)
+        if checkpoint_cancelled():
+            return
 
         server_mode = getattr(self, "_server_mode", False)
+        class_patch_enabled = bool(getattr(
+            self, '_scan_class_tooltip_patch', False))
+        if (not server_mode
+                and (output_mode != 'hybrid' or not class_patch_enabled)):
+            remove_legacy_client_class_patch(self, rp_dir, rp_name)
 
         if output_mode == "jar_patch" or server_mode:
-            self.log("\n--- 階段三：開始生成 JAR 補丁包 ---")
-            self.set_current_item("階段三：生成 JAR 翻譯包...", force=True)
+            if server_mode:
+                self.log("\n--- 階段三：開始生成伺服器 JAR 套用包 ---")
+                self.set_current_item("階段三：生成伺服器翻譯包...", force=True)
+            else:
+                self.log("\n--- 階段三：開始重建客戶端翻譯 JAR ---")
+                self.set_current_item("階段三：重建翻譯 JAR...", force=True)
             phase3_start = time.time()
             output_path = self._generate_jar_patches(rp_dir, rp_name, mc_dir) or ""
             self.log(f"⏱️ 階段三完成：{time.time() - phase3_start:.1f} 秒")
@@ -298,27 +458,42 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
         if datapack_name.lower() == rp_name.lower():
             datapack_name = rp_name[:-4] + "_Datapack.zip"
         datapack_path = os.path.join(rp_dir, datapack_name)
-        if self.datapack_output_var.get() and os.path.exists(datapack_path):
-            try:
-                os.remove(datapack_path)
-            except OSError:
-                pass
 
-        with zipfile.ZipFile(pack_path, 'w', zipfile.ZIP_DEFLATED) as pack:
+        def validate_generated_zip(path):
+            try:
+                with zipfile.ZipFile(path, 'r') as generated:
+                    return generated.testzip() is None
+            except (OSError, zipfile.BadZipFile):
+                return False
+
+        output_ready = False
+        output_atomic_state = {}
+        datapack_requested = bool(self.datapack_output_var.get())
+        output_paths = [pack_path]
+        if datapack_requested:
+            output_paths.append(datapack_path)
+        with atomic_zip_output_group(
+                output_paths,
+                lambda: output_ready and not self.stop_requested,
+                validate=validate_generated_zip,
+                state=output_atomic_state) as atomic_outputs:
+            pack = atomic_outputs[pack_path]
+            if datapack_requested:
+                datapack = atomic_outputs[datapack_path]
+                datapack.writestr(
+                    'pack.mcmeta',
+                    json_bytes(pack_mcmeta(
+                        int(getattr(
+                            self, '_detected_data_pack_format',
+                            self.datapack_format_var.get())),
+                        "§a自動翻譯資料包")))
 
             pack.writestr('pack.mcmeta', json_bytes(pack_mcmeta(pack_format)))
 
             def write_output(internal_path, data):
                 nonlocal datapack
-                if (self.datapack_output_var.get()
+                if (datapack_requested
                         and internal_path.replace('\\', '/').startswith('data/')):
-                    if datapack is None:
-                        datapack = zipfile.ZipFile(datapack_path, 'w', zipfile.ZIP_DEFLATED)
-                        datapack.writestr(
-                            'pack.mcmeta',
-                            json_bytes(pack_mcmeta(
-                                self.datapack_format_var.get(),
-                                "§a自動翻譯資料包")))
                     datapack.writestr(internal_path, data)
                     return "datapack"
                 pack.writestr(internal_path, data)
@@ -338,7 +513,9 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
                                .get(jar_path, {})
                                .get(path_in_jar, {}))
                     if self.process_mode_var.get() == "force":
-                        zh_base = {}
+                        # force 模式不應丟棄 zh_cn fallback，
+                        # 只是不管 zh_tw 是否已存在都重新翻譯
+                        pass
                     else:
                         official_base = self._load_official_minecraft_zh_base(mc_dir, path_in_jar)
                         if official_base:
@@ -352,6 +529,10 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
                         merged_data = merge_structured_json_with_existing_zh(
                             lang_data, zh_base, process_book_data, self._to_traditional,
                             value_needs_update=self._lang_value_needs_update)
+                        if hasattr(self, "_repair_structured_book_json_output"):
+                            merged_data = self._repair_structured_book_json_output(
+                                lang_data, zh_base, merged_data, process_book_data,
+                                f"{jar_name}:{path_in_jar}")
                     else:
                         def process_jar_data(data, preserve=False, strict=False, _path=path_in_jar):
                             return self.process_json_data(
@@ -429,7 +610,12 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
                         continue
                     fixed_text = self.process_book_text_content(content, path_in_jar)
                     self.log(f"📘 {jar_name}: 修正書本換行 {path_in_jar}")
-                    write_output(path_in_jar, safe_utf8_bytes(fixed_text))
+                    fixed_bytes = safe_utf8_bytes(fixed_text)
+                    write_output(path_in_jar, fixed_bytes)
+                    for fallback_path in translated_repair_fallback_paths(path_in_jar):
+                        if fallback_path != path_in_jar:
+                            write_output(fallback_path, fixed_bytes)
+                            self.log(f"📘 {jar_name}: {fallback_path}（fallback 修復覆蓋）")
                     current_task += 1
                     self.update_progress(current_task, total_tasks, text_mode=False)
 
@@ -558,7 +744,7 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
                     with zipfile.ZipFile(zip_path, 'r') as src_zip, \
                          zipfile.ZipFile(out_zip, 'w', zipfile.ZIP_DEFLATED) as dst_zip:
                         for item in src_zip.infolist():
-                            data = src_zip.read(item.filename)
+                            data = src_zip.read(item)
                             if item.filename in internal_set and item.filename.lower().endswith('.json'):
                                 try:
                                     content = self.safe_decode_bytes(data)
@@ -589,14 +775,19 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
                     json_bytes(self.ADDITIONAL_ENTITY_ATTRIBUTES_ZH_TW))
                 self.log("📄 合成 lang: assets/mc_modpack_translator/lang/zh_tw.json")
 
-        if datapack is not None:
-            datapack.close()
+            output_ready = not self.stop_requested
 
-        # 混合模式：資源包蓋不到的 class 硬編碼字串，另出最小 JAR 補丁
-        if output_mode == "hybrid" and not self.stop_requested:
-            self._generate_class_patch_jars(rp_dir, rp_name, mc_dir)
+        if not self.stop_requested and not output_atomic_state.get('committed'):
+            raise RuntimeError("資源包群組驗證或原子替換失敗，舊輸出已保留")
 
         if not self.stop_requested:
+            if output_mode == 'hybrid' and class_patch_enabled:
+                self.set_current_item(
+                    "階段四：生成低風險 class/JAR 補丁...", force=True)
+                class_patch_path = self._generate_class_patch_jars(
+                    rp_dir, rp_name, mc_dir) or ""
+                if class_patch_path:
+                    self.log(f"📦 低風險 class/JAR 補丁：{class_patch_path}")
             self.update_progress(total_tasks, total_tasks, text_mode=False)
             self.log(f"\n🎉 合併翻譯包生成完畢！")
             self.log(f"📦 翻譯包路徑（含 mod 語言 + config + defaultconfigs）：")
