@@ -14,7 +14,7 @@ class CliModTranslatorApp(ModTranslatorApp):
         print(safe, flush=True)
 
     def _ask_proceed_from_thread(self, title, msg):
-        print(f"[CLI] {title}: {msg}", flush=True)
+        self.log(f"[CLI] {title}: {msg}")
         return True
 
     def update_progress(self, current, total, text_mode=False):

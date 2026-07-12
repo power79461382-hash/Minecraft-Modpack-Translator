@@ -1336,7 +1336,6 @@ class ModTranslatorApp:
             ("全域翻譯記憶池", self.global_memory_var),
             ("嚴格白名單防爆", self.strict_whitelist_var),
             ("只補缺漏 + 更新偵測", self.update_detect_var),
-            ("低風險 class/JAR 修補", self.class_tooltip_patch_var),
             ("伺服器大型 JAR 備份", self.include_large_backups_var),
         ]:
             tk.Checkbutton(safety_row, text=caption, variable=var,
@@ -1694,11 +1693,7 @@ class ModTranslatorApp:
             pass
 
     def _output_mode_summary(self):
-        class_patch = bool(getattr(
-            getattr(self, 'class_tooltip_patch_var', None),
-            'get', lambda: False)())
-        suffix = " + 低風險 class 文字" if class_patch else ""
-        return "JAR 直接翻譯", f"語言：zh_tw\n輸出：重建 mods/JAR + 設定{suffix}"
+        return "JAR 直接翻譯", "語言：zh_tw\n輸出：重建 mods/JAR + 低風險 class + 設定"
 
     def _refresh_output_summary(self, *args):
         value, sub = self._output_mode_summary()
@@ -2326,7 +2321,7 @@ class ModTranslatorApp:
             "• 固定使用 JAR 直接翻譯，不需要資源包或 Paxi。\n"
             "• 輸出含重建後 mods/*.jar、版本 JAR、config/defaultconfigs。\n"
             "• 設定原檔保存在 _backups/；大型 JAR 備份需另勾選。\n"
-            "• 勾選『低風險 class 文字修補』才會修改安全範圍內硬編碼 tooltip。\n\n"
+            "• 低風險 class tooltip 自動翻譯；高風險啟動 class 保留原文。\n\n"
         )
         if mode == "jar_patch":
             detail = (
@@ -3092,13 +3087,13 @@ class ModTranslatorApp:
         self.output_mode_var = tk.StringVar(value="jar_patch")
         tk.Label(
             mode_frame,
-            text="📦  JAR 直接翻譯  （免資源包 + 可選低風險 class）",
+            text="📦  JAR 直接翻譯  （免資源包 + 自動低風險 class）",
             bg=self.C_SURFACE, fg=self.C_ACCENT,
             font=("微軟正黑體", 9, "bold")
         ).grid(row=0, column=0, sticky="w", pady=2)
         self.output_mode_hint = tk.Label(
             mode_frame,
-            text="  直接重建 mods/JAR 與設定；低風險 class 由單一選項控制",
+            text="  直接重建 mods/JAR 與設定；安全 tooltip class 自動納入",
             bg=self.C_SURFACE, fg=self.C_MUTED, font=("微軟正黑體", 8), anchor="w")
         self.output_mode_hint.grid(row=1, column=0, sticky="w")
 
@@ -3533,6 +3528,7 @@ class ModTranslatorApp:
         if mode != "jar_patch":
             mode = "jar_patch"
             self.output_mode_var.set(mode)
+        self.class_tooltip_patch_var.set(True)
         hints = {
             "resource_pack": "  安全優先：輸出標準資源包；不重包 JAR，不修改 .class",
             "hybrid": "  自動輸出資源/設定；可選低風險 class/JAR 補丁",
@@ -4248,8 +4244,7 @@ class ModTranslatorApp:
                 self.strict_whitelist_var.set(config.get('strict_whitelist', True))
                 self.update_detect_var.set(config.get('update_detect', True))
                 self.include_large_backups_var.set(config.get('include_large_backups', False))
-                self.class_tooltip_patch_var.set(
-                    config.get('class_tooltip_patch', True))
+                self.class_tooltip_patch_var.set(True)
                 self.auto_normalize_endpoint_var.set(config.get('auto_normalize_endpoint', True))
                 self._on_mc_version_change()
                 self._on_engine_change()

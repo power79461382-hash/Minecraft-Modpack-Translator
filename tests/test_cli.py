@@ -62,6 +62,17 @@ class ParseArgsTests(unittest.TestCase):
                 parse_args()
 
 
+class CliLoggingTests(unittest.TestCase):
+    def test_confirmation_uses_encoding_safe_log_path(self):
+        app = object.__new__(CliModTranslatorApp)
+        app.log = MagicMock()
+
+        result = app._ask_proceed_from_thread("Java 檢查", "⚠ 需要 Java 17")
+
+        self.assertTrue(result)
+        app.log.assert_called_once_with("[CLI] Java 檢查: ⚠ 需要 Java 17")
+
+
 class ApplyFiltersTests(unittest.TestCase):
     """測試 apply_filters 的過濾邏輯，用 mock app。"""
 

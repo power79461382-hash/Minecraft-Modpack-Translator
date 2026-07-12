@@ -1295,9 +1295,13 @@ def scan_single_jar(self, path):
             scan_classes = (
                 scope_mod_lang
                 and not server_mode
-                and getattr(self, "_scan_class_tooltip_patch", False)
-                and getattr(self, "_scan_output_mode", "hybrid") in (
-                    "hybrid", "jar_patch")
+                and (
+                    getattr(self, "_scan_output_mode", "hybrid") == "jar_patch"
+                    or (
+                        getattr(self, "_scan_output_mode", "hybrid") == "hybrid"
+                        and getattr(self, "_scan_class_tooltip_patch", False)
+                    )
+                )
             )
             if scan_classes:
                 for idx, info in enumerate(infos):
@@ -1404,7 +1408,10 @@ def run_analyze_task_impl(self, mod_dir):
     self._scan_process_mode = self.process_mode_var.get() if hasattr(self, "process_mode_var") else "append"
     self._scan_output_mode = self.output_mode_var.get() if hasattr(self, "output_mode_var") else "hybrid"
     self._scan_class_tooltip_patch = bool(
-        getattr(getattr(self, "class_tooltip_patch_var", None), "get", lambda: False)())
+        self._scan_output_mode == 'jar_patch'
+        or getattr(
+            getattr(self, "class_tooltip_patch_var", None),
+            "get", lambda: False)())
     self._scan_scope_mod_lang = self.scope_mod_lang_var.get()
     self._scan_scope_books = self.scope_books_var.get()
     self._scan_scope_quests = self.scope_quests_var.get()

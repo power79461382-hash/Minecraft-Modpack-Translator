@@ -61,7 +61,7 @@ GUI 固定使用單一「JAR 直接翻譯」模式。輸出 ZIP 會把 `zh_tw` �
 
 - 有些文字由模組在執行期動態組合，不一定存在於語言檔或資料檔中。
 - 高風險 JAR 只注入語言、書本等文字資源；Mixin、AccessTransformer、coremod 與其他啟動 class 不修改。
-- class 文字修補只做低風險範圍，完整硬改 class 可能導致崩潰，因此不作為預設策略。
+- 低風險 item/block tooltip class 會自動修補；高風險啟動 class 仍保留原文。
 - 書本、任務、GUI 的格式差異很大，無法安全解析的檔案會被略過並記錄。
 - Bing / Azure / GTX 免 Key 或免費額度翻譯可能被限流，速度會依網路與端點狀態波動。
 
