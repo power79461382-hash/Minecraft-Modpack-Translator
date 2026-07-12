@@ -82,6 +82,21 @@ def test_hybrid_scan_collects_opted_in_low_risk_class_rewrites(tmp_path):
     }
 
 
+def test_direct_scan_collects_opted_in_low_risk_class_rewrites(tmp_path):
+    jar_path = tmp_path / "example.jar"
+    with zipfile.ZipFile(jar_path, "w") as jar:
+        jar.writestr("example/item/Tooltip.class", b"class-bytes")
+
+    app = _ScanApp("jar_patch")
+    scan_single_jar(app, str(jar_path))
+
+    assert app.analyzed_class_texts == {
+        str(jar_path): {
+            "example/item/Tooltip.class": ["Hardcoded tooltip"],
+        }
+    }
+
+
 def test_hybrid_scan_skips_class_rewrites_without_opt_in(tmp_path):
     jar_path = tmp_path / "example.jar"
     with zipfile.ZipFile(jar_path, "w") as jar:

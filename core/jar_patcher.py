@@ -719,7 +719,12 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
     openloader_available = self._has_openloader_resources(mc_dir)
     openloader_overlay_count = 0
     paxi_available = has_paxi(mc_dir)
-    client_safe_mode = not bool(getattr(self, '_server_mode', False))
+    server_mode = bool(getattr(self, '_server_mode', False))
+    active_output_mode = getattr(
+        self, '_active_output_mode',
+        getattr(self, '_scan_output_mode', 'hybrid'))
+    direct_client_mode = not server_mode and active_output_mode == 'jar_patch'
+    client_safe_mode = not server_mode and not direct_client_mode
     paxi_resource_overlay = PaxiOverlayAccumulator()
     paxi_data_overlay = PaxiOverlayAccumulator()
     safe_overlay_base = re.sub(
@@ -1077,7 +1082,8 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
             # avoids rewriting hundreds of JARs and never touches their code or
             # signatures. Advancement JSON can use a Paxi datapack; Patchouli
             # data stays in its source archive for older-version compatibility.
-            if paxi_available and is_paxi_mod_archive:
+            if (not direct_client_mode
+                    and paxi_available and is_paxi_mod_archive):
                 resource_safe, data_safe, _residual = split_paxi_safe_inject(
                     inject)
                 original_asset_paths = {
@@ -1343,7 +1349,7 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
             patched_count = 0
             normalized_rel = rel_path.lower()
             paxi_source_kind = None
-            if paxi_available:
+            if paxi_available and not direct_client_mode:
                 if normalized_rel.startswith('config/paxi/resourcepacks/'):
                     paxi_source_kind = 'resource'
                 elif normalized_rel.startswith('config/paxi/datapacks/'):
@@ -1423,7 +1429,11 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
                 'assets/additionalentityattributes/lang/zh_tw.json':
                     json_bytes(self.ADDITIONAL_ENTITY_ATTRIBUTES_ZH_TW),
             }
-            if paxi_available:
+            if direct_client_mode:
+                self.log(
+                    "📄 JAR 直接模式略過 2 個無來源模組的合成 lang；"
+                    "不產生 Paxi/資源包殘留。")
+            elif paxi_available:
                 for path, payload in synthetic_entries.items():
                     merge_paxi_overlay_entry(
                         paxi_resource_overlay, path, payload)
@@ -1533,10 +1543,8 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
             else:
                 report_name = 'SKIPPED_HIGH_RISK_JARS.txt'
                 report_lines = [
-                    "以下 JAR 含 Mixin/CoreMod/AccessTransformer/ModLauncher 啟動期轉換，",
-                    "為避免翻譯器重包後觸發啟動崩潰，已保留原始 JAR 不修改。",
-                    "若模組包有 Paxi，assets 語言/書本與 advancement/Patchouli 資料會改用安全覆蓋。",
-                    "若只有 OpenLoader，assets 文字會改寫到 config/openloader/resources/。",
+                    "以下 JAR 的低風險文字資源已直接注入；啟動期高風險 class 未修改。",
+                    "若項目只有高風險 class 而無語言/書本資源，會保留原始 JAR。",
                     "class 硬編碼與其他高風險內容仍維持原文。",
                     "",
                 ]
@@ -1560,6 +1568,8 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
             self.log(f"\n🎉 合併翻譯包生成完畢！")
             if server_mode:
                 self.log("📦 伺服器翻譯包路徑（mods + config + defaultconfigs）：")
+            elif direct_client_mode:
+                self.log("📦 客戶端 JAR 直接翻譯包路徑（mods/JAR + config）：")
             else:
                 self.log(
                     "📦 客戶端安全覆蓋路徑（Paxi/OpenLoader + config；"
@@ -1588,6 +1598,15 @@ def generate_jar_patches(self, rp_dir, rp_name, mc_dir):
                     self.log(f"   ℹ️ 已略過 {skipped_large_backup_count} 個大型 JAR 備份（可在安全增量勾選「大型 JAR 備份」啟用）")
                 self.log(f"   ④ 重新啟動伺服器 → 任務書/怪物命名/進度文字全員生效（玩家免裝補丁）")
                 self.log(f"   ℹ️ mod 介面/tooltip/死亡訊息屬客戶端範疇，請玩家另外安裝客戶端翻譯包")
+            elif direct_client_mode:
+                self.log(f"   ① 關閉遊戲與啟動器")
+                self.log(f"   ② 將 {os.path.basename(combined_zip_path)} 整包解壓到「遊戲根目錄」並覆蓋")
+                self.log("      ZIP 內含重建後 mods/*.jar、版本 JAR 與 config；不需資源包")
+                if backup_count:
+                    self.log(f"   ③ ZIP 內含 _backups/ 原始備份 {backup_count} 個，可執行 RESTORE_BACKUP.bat 還原")
+                elif skipped_large_backup_count:
+                    self.log("   ℹ️ 大型 JAR 備份未啟用；套用前請自行保留整合包副本")
+                self.log("   ④ 重啟遊戲即生效")
             else:
                 self.log(f"   將 {os.path.basename(combined_zip_path)} 解壓到「遊戲根目錄」")
                 self.log(

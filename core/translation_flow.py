@@ -97,6 +97,7 @@ def remove_legacy_client_class_patch(app, output_dir, output_name):
 
 def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patch"):
     output_mode = output_mode if output_mode in ("resource_pack", "hybrid", "jar_patch") else "hybrid"
+    self._active_output_mode = output_mode
     pack_format = int(getattr(
         self, '_detected_resource_pack_format', pack_format))
     mc_dir = self.analyzed_mc_dir          # 使用分析時的根目錄，確保 rel_path 正確
@@ -422,8 +423,8 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
                 self.log("\n--- 階段三：開始生成伺服器 JAR 套用包 ---")
                 self.set_current_item("階段三：生成伺服器翻譯包...", force=True)
             else:
-                self.log("\n--- 階段三：開始生成客戶端安全覆蓋包 ---")
-                self.set_current_item("階段三：生成安全覆蓋包...", force=True)
+                self.log("\n--- 階段三：開始重建客戶端翻譯 JAR ---")
+                self.set_current_item("階段三：重建翻譯 JAR...", force=True)
             phase3_start = time.time()
             output_path = self._generate_jar_patches(rp_dir, rp_name, mc_dir) or ""
             self.log(f"⏱️ 階段三完成：{time.time() - phase3_start:.1f} 秒")

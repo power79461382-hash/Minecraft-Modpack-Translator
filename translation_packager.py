@@ -274,7 +274,23 @@ def load_json_content(content, clean_json_text):
 def load_lang_content(content, source_path, clean_json_text):
     if str(source_path).lower().endswith('.lang'):
         return parse_legacy_lang_content(content)
-    return load_json_content(content, clean_json_text)
+    try:
+        return load_json_content(content, clean_json_text)
+    except (json.JSONDecodeError, ValueError):
+        recovered = {}
+        for raw_line in str(content).lstrip('\ufeff').splitlines():
+            line = raw_line.strip().rstrip(',')
+            if not line.startswith('"') or ':' not in line:
+                continue
+            try:
+                item = json.loads('{' + line + '}')
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict) and len(item) == 1:
+                recovered.update(item)
+        if recovered:
+            return recovered
+        raise
 
 
 def lang_bytes(source_path, data):

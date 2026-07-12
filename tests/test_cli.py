@@ -24,7 +24,7 @@ class ParseArgsTests(unittest.TestCase):
         with patch.object(sys, 'argv', ['translate_cli.py', '--modpack', '/tmp/mc']):
             args = parse_args()
         self.assertEqual(args.modpack, '/tmp/mc')
-        self.assertEqual(args.output_mode, 'hybrid')
+        self.assertEqual(args.output_mode, 'jar_patch')
         self.assertEqual(args.name, 'Auto_Translated_Mods_zh_tw.zip')
         self.assertFalse(args.dry_run)
 

@@ -49,6 +49,7 @@ from translation_packager import (
     locale_segment,
     merge_zh_base_fallback,
     merge_structured_json_with_existing_zh,
+    load_lang_content,
     parse_legacy_lang_content,
     structured_json_needs_update,
     translated_fallback_paths,
@@ -297,6 +298,20 @@ class ProviderHelperTests(unittest.TestCase):
 
 
 class PackagerTests(unittest.TestCase):
+    def test_flat_lang_json_recovers_missing_commas_and_trailing_junk(self):
+        content = '''{
+          "item.example.one": "One"
+          "item.example.two": "Two",
+        }"
+        }'''
+
+        parsed = load_lang_content(content, "assets/example/lang/en_us.json", lambda v: v)
+
+        self.assertEqual(parsed, {
+            "item.example.one": "One",
+            "item.example.two": "Two",
+        })
+
     def test_legacy_lang_and_translated_path(self):
         parsed = parse_legacy_lang_content("# c\nitem.foo=Foo\nbad line\n")
         self.assertEqual(parsed, {"item.foo": "Foo"})

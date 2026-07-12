@@ -168,6 +168,68 @@ def test_paxi_merges_language_overlays_without_rebuilding_source_jars():
         }
 
 
+def test_direct_client_mode_rebuilds_mod_jar_without_paxi_overlay():
+    with tempfile.TemporaryDirectory() as tmp:
+        mc_dir = os.path.join(tmp, "instance")
+        mods_dir = os.path.join(mc_dir, "mods")
+        os.makedirs(mods_dir)
+        open(os.path.join(mods_dir, "Paxi-1.20.1.jar"), "wb").close()
+        jar_path = os.path.join(mods_dir, "example.jar")
+        with zipfile.ZipFile(jar_path, "w") as jar:
+            jar.writestr("META-INF/mods.toml", "modLoader='javafml'")
+            jar.writestr(
+                "assets/example/lang/en_us.json",
+                json.dumps({"item.example.one": "One"}),
+            )
+        original_bytes = open(jar_path, "rb").read()
+
+        app = OverlayApp([jar_path])
+        app._active_output_mode = "jar_patch"
+        output = generate_jar_patches(
+            app, tmp, "translation.zip", mc_dir)
+
+        with zipfile.ZipFile(output) as pack:
+            names = set(pack.namelist())
+            assert "mods/example.jar" in names
+            assert not any(
+                name.startswith("config/paxi/resourcepacks/")
+                for name in names
+            )
+            rebuilt_bytes = pack.read("mods/example.jar")
+
+        with zipfile.ZipFile(io.BytesIO(rebuilt_bytes)) as rebuilt:
+            translated = json.loads(rebuilt.read(
+                "assets/example/lang/zh_tw.json").decode("utf-8"))
+
+        assert translated == {"item.example.one": "中:One"}
+        assert open(jar_path, "rb").read() == original_bytes
+
+
+def test_direct_client_mode_does_not_emit_synthetic_paxi_pack():
+    with tempfile.TemporaryDirectory() as tmp:
+        mc_dir = os.path.join(tmp, "instance")
+        mods_dir = os.path.join(mc_dir, "mods")
+        os.makedirs(mods_dir)
+        open(os.path.join(mods_dir, "Paxi-1.20.1.jar"), "wb").close()
+        jar_path = os.path.join(mods_dir, "example.jar")
+        with zipfile.ZipFile(jar_path, "w") as jar:
+            jar.writestr("META-INF/mods.toml", "modLoader='javafml'")
+
+        app = OverlayApp([jar_path])
+        app._active_output_mode = "jar_patch"
+        app.scope_mod_lang_var = Value(True)
+        app.SYNTHETIC_LANG_ZH_TW = {"translator.test": "測試"}
+        app.ADDITIONAL_ENTITY_ATTRIBUTES_ZH_TW = {"attribute.test": "屬性"}
+        output = generate_jar_patches(
+            app, tmp, "translation.zip", mc_dir)
+
+        with zipfile.ZipFile(output) as pack:
+            assert not any(
+                name.startswith("config/paxi/")
+                for name in pack.namelist()
+            )
+
+
 def test_paxi_synthetic_languages_are_inside_overlay_not_instance_assets():
     with tempfile.TemporaryDirectory() as tmp:
         mc_dir = os.path.join(tmp, "instance")

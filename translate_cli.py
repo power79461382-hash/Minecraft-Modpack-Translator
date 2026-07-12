@@ -48,7 +48,7 @@ def parse_args():
     parser.add_argument("--output-dir", default=None, help="Output folder")
     parser.add_argument("--name", default="Auto_Translated_Mods_zh_tw.zip")
     parser.add_argument("--output-mode", choices=("resource_pack", "hybrid", "jar_patch"),
-                        default="hybrid")
+                        default="jar_patch")
     parser.add_argument("--dry-run", action="store_true", help="Scan only, do not translate")
     parser.add_argument("--skip-mods", action="store_true", help="Skip JAR/mod language outputs")
     parser.add_argument("--skip-quests", action="store_true", help="Skip quest/config outputs")

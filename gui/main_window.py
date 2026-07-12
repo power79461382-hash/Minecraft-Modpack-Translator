@@ -1210,7 +1210,7 @@ class ModTranslatorApp:
         self.rp_dir_var = tk.StringVar()
         self.rp_name_var = tk.StringVar(value="Auto_Translated_Mods_zh_tw")
         self.datapack_name_var = tk.StringVar(value="")
-        self.output_mode_var = tk.StringVar(value="hybrid")
+        self.output_mode_var = tk.StringVar(value="jar_patch")
         self.mc_version_var = tk.StringVar(value="等待自動判定")
         self.datapack_format_var = tk.IntVar(value=15)
         self.process_mode_var = tk.StringVar(value="append")
@@ -1262,9 +1262,9 @@ class ModTranslatorApp:
                  anchor="w").grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         label(project, 3, "輸出模式")
-        self.output_mode_var.set("hybrid")
+        self.output_mode_var.set("jar_patch")
         mode_badge = tk.Label(
-            project, text="混合模式（自動輸出）", bg="#0b6c70", fg=text,
+            project, text="JAR 直接翻譯（免資源包）", bg="#0b6c70", fg=text,
             font=("微軟正黑體", 9, "bold"), padx=18, pady=6,
             anchor="center")
         mode_badge.grid(row=3, column=1, columnspan=3, sticky="ew", pady=6, padx=(8, 6))
@@ -1697,8 +1697,8 @@ class ModTranslatorApp:
         class_patch = bool(getattr(
             getattr(self, 'class_tooltip_patch_var', None),
             'get', lambda: False)())
-        suffix = " + 低風險 class/JAR 補丁" if class_patch else ""
-        return "混合模式", f"語言：zh_tw\n輸出：資源包 + 設定覆蓋{suffix}"
+        suffix = " + 低風險 class 文字" if class_patch else ""
+        return "JAR 直接翻譯", f"語言：zh_tw\n輸出：重建 mods/JAR + 設定{suffix}"
 
     def _refresh_output_summary(self, *args):
         value, sub = self._output_mode_summary()
@@ -2249,7 +2249,7 @@ class ModTranslatorApp:
             self.ai_provider_cb.focus_set()
             self.log("INFO  已切換到翻譯引擎設定。")
         elif key == "output":
-            self.log("INFO  已切換到輸出設定；預設使用安全資源包，避免直接重包 JAR。")
+            self.log("INFO  已切換到輸出設定；固定使用 JAR 直接翻譯，不需資源包。")
         elif key == "log" and hasattr(self, "log_area"):
             self.log_area.focus_set()
             self.log("INFO  已切換到執行記錄。")
@@ -2306,14 +2306,14 @@ class ModTranslatorApp:
         """輸出檔案安裝說明：依目前輸出模式說明每個產物該放哪、要不要解壓。"""
         rp_name = (self.rp_name_var.get().strip() or "翻譯包") if hasattr(self, "rp_name_var") else "翻譯包"
         mode = (self.output_mode_var.get()
-                if hasattr(self, "output_mode_var") else "hybrid")
+                if hasattr(self, "output_mode_var") else "jar_patch")
         server_note = (
             "伺服器（服務端）翻譯\n"
             "────────────────────────────\n"
             "• 把「來源資料夾」指到伺服器目錄（含 server.properties 那層）再分析，\n"
             "  並在安全確認視窗明確啟用伺服器模式：只翻任務書、advancement 顯示文字、\n"
             "  Apotheosis 命名表（這些由伺服器同步，玩家不用裝補丁就看得到中文）。\n"
-            "• 只有伺服器模式可能輸出 JAR 套用包（不產生客戶端資源包）：\n"
+            "• 伺服器模式同樣輸出 JAR 套用包（不產生客戶端資源包）：\n"
             "  停服 → 整包解壓覆蓋到伺服器根目錄（mods/ + config/）→ 重啟伺服器。\n"
             "• 小型設定/任務檔會附 _backups/；大型 JAR 備份可在「安全增量」勾選啟用。\n"
             "• 伺服器模式不做 class 硬編碼修補（壞一個 class 會全服崩潰，故關閉）；\n"
@@ -2323,20 +2323,18 @@ class ModTranslatorApp:
         common = server_note + (
             "通用觀念\n"
             "────────────────────────────\n"
-            "• 固定使用混合模式：語言與手冊走資源包，設定走安全覆蓋。\n"
-            "• 勾選『低風險 class/JAR 修補』時會另出補丁 ZIP，內含原始備份。\n"
-            "• 資源包 ZIP 放進 resourcepacks/ 並啟用即可。\n"
-            "  若輸出資料夾就是整合包根目錄或 resourcepacks/，工具會自動啟用。\n"
-            "• 安全覆蓋 ZIP 只能把 config/、defaultconfigs/、_translator/\n"
-            "  解壓到遊戲根目錄；若看見 mods/*.jar，請勿套用。\n\n"
+            "• 固定使用 JAR 直接翻譯，不需要資源包或 Paxi。\n"
+            "• 輸出含重建後 mods/*.jar、版本 JAR、config/defaultconfigs。\n"
+            "• 設定原檔保存在 _backups/；大型 JAR 備份需另勾選。\n"
+            "• 勾選『低風險 class 文字修補』才會修改安全範圍內硬編碼 tooltip。\n\n"
         )
         if mode == "jar_patch":
             detail = (
-                "目前模式：安全覆蓋套用\n"
+                "目前模式：JAR 直接翻譯\n"
                 "────────────────────────────\n"
                 f"① {rp_name.replace('.zip', '')}_模組語言包.zip\n"
-                "   → 解壓到遊戲根目錄，只會套用 Paxi/OpenLoader 與設定檔。\n"
-                "   → 無安全覆蓋通道的文字保留原文，不會重建模組 JAR。\n"
+                "   → 關閉遊戲後，整包解壓到實例根目錄並覆蓋。\n"
+                "   → 內含重建後 mods/*.jar、版本 JAR 與設定檔，不需啟用資源包。\n"
                 "   → 若有 TRANSLATOR_RUNTIME_WARNING.txt，先依內容修正 Java。\n"
             )
         else:
@@ -2389,7 +2387,7 @@ class ModTranslatorApp:
             "Minecraft 模組翻譯器\n"
             "版本：v1.2.2\n"
             "預設模型：DeepSeek V4 Flash Free (OpenRouter)\n"
-            "支援：固定混合模式、自動判定、全域記憶池與多 API 模型"
+            "支援：JAR 直接翻譯、自動判定、全域記憶池與多 API 模型"
         )
         self.log("INFO  已開啟關於資訊。")
         messagebox.showinfo("關於", msg)
@@ -2501,8 +2499,8 @@ class ModTranslatorApp:
 
         mode_row = tk.Frame(project, bg=self.C_SURFACE)
         mode_row.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 2))
-        self.output_mode_var = tk.StringVar(value="hybrid")
-        tk.Label(mode_row, text="安全資源包", bg=self.C_SURFACE, fg=self.C_ACCENT,
+        self.output_mode_var = tk.StringVar(value="jar_patch")
+        tk.Label(mode_row, text="JAR 直接翻譯", bg=self.C_SURFACE, fg=self.C_ACCENT,
                  font=("微軟正黑體", 9, "bold")).pack(side=tk.LEFT, padx=(0, 16))
         self.output_mode_hint = tk.Label(project, text="",
                                          bg=self.C_SURFACE, fg=self.C_MUTED,
@@ -3091,16 +3089,16 @@ class ModTranslatorApp:
             row=6, column=0, columnspan=2, sticky="w", pady=(10, 3))
         mode_frame = tk.Frame(card1, bg=self.C_SURFACE)
         mode_frame.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(0, 4))
-        self.output_mode_var = tk.StringVar(value="hybrid")
+        self.output_mode_var = tk.StringVar(value="jar_patch")
         tk.Label(
             mode_frame,
-            text="📦  混合模式  （資源包 + 設定覆蓋 + 可選 class/JAR）",
+            text="📦  JAR 直接翻譯  （免資源包 + 可選低風險 class）",
             bg=self.C_SURFACE, fg=self.C_ACCENT,
             font=("微軟正黑體", 9, "bold")
         ).grid(row=0, column=0, sticky="w", pady=2)
         self.output_mode_hint = tk.Label(
             mode_frame,
-            text="  自動輸出資源與設定；低風險 class/JAR 由單一選項控制",
+            text="  直接重建 mods/JAR 與設定；低風險 class 由單一選項控制",
             bg=self.C_SURFACE, fg=self.C_MUTED, font=("微軟正黑體", 8), anchor="w")
         self.output_mode_hint.grid(row=1, column=0, sticky="w")
 
@@ -3525,20 +3523,20 @@ class ModTranslatorApp:
                    "② config/defaultconfigs 再解壓到遊戲根目錄\n"
                    "③ 若有 Class 補丁 ZIP，再解壓至實例根目錄；原檔在 _backups/"),
         "jar_patch": ("輸出後怎麼用：\n"
-                      "① 安全覆蓋 ZIP 解壓到遊戲根目錄\n"
-                      "② 只含 Paxi/OpenLoader、config、defaultconfigs\n"
-                      "③ 絕不含 mods/*.jar，也不修改 .class"),
+                      "① 關閉遊戲與啟動器\n"
+                      "② 翻譯 ZIP 整包解壓到遊戲根目錄並覆蓋\n"
+                      "③ 原始檔可由 _backups/ 還原；不需資源包"),
     }
 
     def _on_output_mode_change(self):
         mode = self.output_mode_var.get()
-        if mode != "hybrid":
-            mode = "hybrid"
+        if mode != "jar_patch":
+            mode = "jar_patch"
             self.output_mode_var.set(mode)
         hints = {
             "resource_pack": "  安全優先：輸出標準資源包；不重包 JAR，不修改 .class",
             "hybrid": "  自動輸出資源/設定；可選低風險 class/JAR 補丁",
-            "jar_patch": "  Paxi/OpenLoader + 設定覆蓋；絕不輸出 mods/*.jar 或修改 .class",
+            "jar_patch": "  直接重建 mods/JAR + 設定；不需資源包，原始檔附於 _backups/",
         }
         self.output_mode_hint.config(text=hints[mode])
         if hasattr(self, "sidebar_guide_label"):
@@ -4235,7 +4233,7 @@ class ModTranslatorApp:
                 self.local_url_var.set(config.get('local_url', 'http://localhost:1234/v1/chat/completions'))
                 self.mc_version_var.set('等待自動判定')
                 self.workers_var.set(config.get('workers', 8))
-                self.output_mode_var.set('hybrid')
+                self.output_mode_var.set('jar_patch')
                 saved_process_mode = config.get('process_mode', 'append')
                 if saved_process_mode == 'force':
                     saved_process_mode = 'append'
