@@ -1,6 +1,8 @@
 import concurrent.futures
+import glob
 import json
 import os
+import re
 import time
 import tkinter as tk
 import traceback
@@ -29,6 +31,18 @@ GENERATED_TRANSLATOR_DIR_MARKERS = (
 )
 
 SINGLE_JAR_SCAN_BUDGET_SECONDS = 120.0
+MAX_VERSION_JSON_BYTES = 8 * 1024 * 1024
+MAX_LATEST_LOG_TAIL_BYTES = 512 * 1024
+LATEST_LOG_HEAD_BYTES = 64 * 1024
+
+_MC_VERSION_TOKEN_RE = re.compile(
+    r'(?<![0-9.])(\d+\.\d+(?:\.\d+)?)(?![0-9]|\.\d)')
+_PLAIN_MC_VERSION_RE = re.compile(r'^\d+\.\d+(?:\.\d+)?$')
+_JAVA_VERSION_LOG_RE = re.compile(
+    r'\bjava\s+version\s*(?:[:=]\s*)?["\']?'
+    r'(?P<version>\d+(?:[._]\d+)*)',
+    re.IGNORECASE,
+)
 
 TOP_LEVEL_SCAN_IGNORE = {'libraries', 'bin', 'jre', 'versions'}
 RUNTIME_CACHE_DIRS = {
@@ -118,7 +132,767 @@ def should_descend_scan_dir(mod_dir, root_dir, dirname):
     return True
 
 
-def should_scan_translation_archive(mod_dir, path):
+def is_minecraft_version_root_jar(mod_dir, path):
+    """Return whether a root JAR is the client version's executable archive."""
+    parts = _rel_parts(mod_dir, path)
+    if len(parts) != 1 or os.path.splitext(parts[0])[1].lower() != '.jar':
+        return False
+    jar_stem = os.path.splitext(parts[0])[0]
+    instance_name = os.path.basename(os.path.abspath(os.path.normpath(mod_dir)))
+    if jar_stem.casefold() == instance_name.casefold():
+        return True
+    return os.path.isfile(os.path.join(mod_dir, jar_stem + '.json'))
+
+
+def is_minecraft_client_version_directory(mod_dir):
+    """Return whether a directory is a launcher client version directory."""
+    normalized = os.path.abspath(os.path.normpath(mod_dir))
+    versions_dir = os.path.dirname(normalized)
+    if os.path.basename(versions_dir).casefold() != 'versions':
+        return False
+    version_id = os.path.basename(normalized)
+    return os.path.isfile(os.path.join(normalized, version_id + '.json'))
+
+
+def detect_minecraft_server_mode(mod_dir, explicit_opt_in=False):
+    """Enable JAR-writing server mode only after an explicit user opt-in."""
+    return (
+        bool(explicit_opt_in)
+        and
+        os.path.isfile(os.path.join(mod_dir, 'server.properties'))
+        and not is_minecraft_client_version_directory(mod_dir)
+    )
+
+
+def _supported_mc_versions(pack_formats):
+    supported = []
+    if not isinstance(pack_formats, dict):
+        return supported
+    for label, formats in pack_formats.items():
+        if not isinstance(label, str) or not isinstance(formats, dict):
+            continue
+        base = label[:-1] if label.endswith('+') else label
+        if not _PLAIN_MC_VERSION_RE.fullmatch(base):
+            continue
+        try:
+            parts = tuple(int(part) for part in base.split('.'))
+            rp = int(formats['rp'])
+            dp = int(formats['dp'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        supported.append({
+            'label': label,
+            'base': base,
+            'parts': parts,
+            'plus': label.endswith('+'),
+            'rp': rp,
+            'dp': dp,
+        })
+    return supported
+
+
+def _supported_version_label(candidate, supported):
+    exact = next(
+        (item for item in supported
+         if not item['plus'] and item['base'] == candidate),
+        None,
+    )
+    if exact is not None:
+        return exact['label']
+    try:
+        parts = tuple(int(part) for part in candidate.split('.'))
+    except ValueError:
+        return None
+    for item in supported:
+        floor = item['parts']
+        if (item['plus'] and parts[:2] == floor[:2]
+                and parts >= floor):
+            return item['label']
+    return None
+
+
+def _versions_in_text(value, supported):
+    if not isinstance(value, str):
+        return []
+    found = []
+    for match in _MC_VERSION_TOKEN_RE.finditer(value):
+        label = _supported_version_label(match.group(1), supported)
+        if label is not None and label not in found:
+            found.append(label)
+    return found
+
+
+def _candidate_version_json_paths(mod_dir):
+    mod_dir = os.path.abspath(os.path.normpath(mod_dir))
+    paths = []
+
+    def add(path):
+        normalized = os.path.normcase(os.path.abspath(path))
+        if normalized not in seen and os.path.isfile(path):
+            seen.add(normalized)
+            paths.append(path)
+
+    seen = set()
+    add(os.path.join(mod_dir, os.path.basename(mod_dir) + '.json'))
+    try:
+        for entry in os.scandir(mod_dir):
+            if entry.is_file(follow_symlinks=False) and entry.name.lower().endswith('.json'):
+                add(entry.path)
+    except OSError:
+        return paths
+
+    if os.path.basename(mod_dir).casefold() == 'versions':
+        try:
+            children = [
+                entry for entry in os.scandir(mod_dir)
+                if entry.is_dir(follow_symlinks=False)
+            ]
+        except OSError:
+            children = []
+        for child in children:
+            add(os.path.join(child.path, child.name + '.json'))
+    return paths
+
+
+def _load_version_json_safely(path):
+    try:
+        if os.path.getsize(path) > MAX_VERSION_JSON_BYTES:
+            return None
+        with open(path, 'r', encoding='utf-8-sig') as handle:
+            data = json.load(handle)
+    except (OSError, UnicodeError, ValueError, RecursionError, MemoryError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _content_version_votes(data, supported):
+    votes = []
+    stack = [(None, data)]
+    visited = 0
+    excluded_keys = {'clientversion', 'id', 'inheritsfrom'}
+    while stack and visited < 100_000:
+        key, value = stack.pop()
+        visited += 1
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                if str(child_key).casefold() not in excluded_keys:
+                    stack.append((child_key, child_value))
+        elif isinstance(value, (list, tuple)):
+            stack.extend((key, child) for child in value)
+        elif isinstance(value, str):
+            votes.extend(_versions_in_text(value, supported))
+    return votes
+
+
+def _unique_vote_winner(votes, require_majority=False):
+    counts = {}
+    for version in votes:
+        counts[version] = counts.get(version, 0) + 1
+    if not counts:
+        return None, False
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+        return None, True
+    if require_majority and (
+            ranked[0][1] < 2 or ranked[0][1] * 2 <= sum(counts.values())):
+        return None, True
+    return ranked[0][0], False
+
+
+def _mods_filename_votes(mod_dir, supported):
+    candidate_dirs = [os.path.join(mod_dir, 'mods')]
+    if os.path.basename(os.path.normpath(mod_dir)).casefold() == 'versions':
+        try:
+            candidate_dirs.extend(
+                os.path.join(entry.path, 'mods')
+                for entry in os.scandir(mod_dir)
+                if entry.is_dir(follow_symlinks=False)
+            )
+        except OSError:
+            pass
+    votes = []
+    for mods_dir in candidate_dirs:
+        try:
+            entries = os.scandir(mods_dir)
+        except OSError:
+            continue
+        with entries:
+            for entry in entries:
+                if (not entry.is_file(follow_symlinks=False)
+                        or not entry.name.lower().endswith('.jar')):
+                    continue
+                versions = _versions_in_text(entry.name, supported)
+                if len(versions) == 1:
+                    votes.append(versions[0])
+    return votes
+
+
+def detect_minecraft_pack_version(mod_dir, pack_formats):
+    """Detect a supported Minecraft version without modifying the instance."""
+    supported = _supported_mc_versions(pack_formats)
+    if not supported or not os.path.isdir(mod_dir):
+        return None
+
+    tier_votes = {
+        'version_json.clientVersion': [],
+        'version_json.inheritsFrom': [],
+        'version_json.library': [],
+        'version_json.id': [],
+        'version_json.content': [],
+    }
+    for path in _candidate_version_json_paths(mod_dir):
+        data = _load_version_json_safely(path)
+        if data is None:
+            continue
+
+        client_version = data.get('clientVersion')
+        if (isinstance(client_version, str)
+                and _PLAIN_MC_VERSION_RE.fullmatch(client_version.strip())):
+            label = _supported_version_label(client_version.strip(), supported)
+            if label is not None:
+                tier_votes['version_json.clientVersion'].append(label)
+
+        for field, source in (
+                ('inheritsFrom', 'version_json.inheritsFrom'),
+                ('id', 'version_json.id')):
+            value = data.get(field)
+            if (not isinstance(value, str) or len(value) > 160
+                    or '/' in value or '\\' in value):
+                continue
+            versions = _versions_in_text(value, supported)
+            if len(versions) == 1:
+                tier_votes[source].append(versions[0])
+
+        libraries = data.get('libraries')
+        if isinstance(libraries, list):
+            for library in libraries:
+                name = library.get('name') if isinstance(library, dict) else None
+                if not isinstance(name, str):
+                    continue
+                lowered = name.casefold()
+                if ('net.minecraftforge:' not in lowered
+                        or (':fmlloader:' not in lowered
+                            and ':forge:' not in lowered)):
+                    continue
+                versions = _versions_in_text(name, supported)
+                if len(versions) == 1:
+                    tier_votes['version_json.library'].append(versions[0])
+
+        tier_votes['version_json.content'].extend(
+            _content_version_votes(data, supported))
+
+    for source in (
+            'version_json.clientVersion',
+            'version_json.inheritsFrom',
+            'version_json.library',
+            'version_json.id',
+            'version_json.content'):
+        version, ambiguous = _unique_vote_winner(tier_votes[source])
+        if ambiguous:
+            return None
+        if version is not None:
+            formats = next(
+                item for item in supported if item['label'] == version)
+            return {
+                'version': version,
+                'rp': formats['rp'],
+                'dp': formats['dp'],
+                'source': source,
+            }
+
+    version, _ambiguous = _unique_vote_winner(
+        _mods_filename_votes(mod_dir, supported), require_majority=True)
+    if version is None:
+        return None
+    formats = next(item for item in supported if item['label'] == version)
+    return {
+        'version': version,
+        'rp': formats['rp'],
+        'dp': formats['dp'],
+        'source': 'mods.filename_majority',
+    }
+
+
+def sync_detected_pack_formats(app, mod_dir):
+    """Detect pack formats and safely reflect them in Tk-backed UI state."""
+    detected = detect_minecraft_pack_version(
+        mod_dir, getattr(app, 'MC_PACK_FORMATS', {}))
+    if not detected:
+        for attr in (
+                '_detected_mc_version', '_detected_pack_format',
+                '_detected_resource_pack_format', '_detected_datapack_format',
+                '_detected_data_pack_format'):
+            if hasattr(app, attr):
+                delattr(app, attr)
+
+        def mark_unknown():
+            hint = getattr(app, 'pack_format_hint', None)
+            configure = getattr(hint, 'config', None)
+            if callable(configure):
+                configure(text="無法自動判定版本，已停止分析")
+
+        root = getattr(app, 'root', None)
+        after = getattr(root, 'after', None)
+        if callable(after):
+            after(0, mark_unknown)
+        else:
+            mark_unknown()
+        log = getattr(app, 'log', None)
+        if callable(log):
+            log("⛔ 無法可靠判定 Minecraft 版本，不會沿用手動或舊設定。")
+        return None
+
+    version = detected['version']
+    resource_format = int(detected['rp'])
+    data_format = int(detected['dp'])
+    # Plain attributes are safe to read from packaging workers even before the
+    # Tk event queue has applied the visible controls.
+    app._detected_mc_version = version
+    app._detected_pack_format = resource_format
+    app._detected_resource_pack_format = resource_format
+    app._detected_datapack_format = data_format
+    app._detected_data_pack_format = data_format
+
+    def apply_to_ui():
+        for attr, value in (
+                ('mc_version_var', version),
+                ('pack_format_var', resource_format),
+                ('datapack_format_var', data_format)):
+            variable = getattr(app, attr, None)
+            setter = getattr(variable, 'set', None)
+            if callable(setter):
+                setter(value)
+        hint = getattr(app, 'pack_format_hint', None)
+        configure = getattr(hint, 'config', None)
+        if callable(configure):
+            configure(text=(
+                f"Minecraft {version} / Resource Pack：{resource_format} / "
+                f"Data Pack：{data_format}"))
+
+    root = getattr(app, 'root', None)
+    after = getattr(root, 'after', None)
+    if callable(after):
+        after(0, apply_to_ui)
+    else:
+        apply_to_ui()
+    log = getattr(app, 'log', None)
+    if callable(log):
+        log(
+            f"🧭 自動偵測 Minecraft {version}："
+            f"Resource Pack {resource_format} / Data Pack {data_format}"
+            f"（{detected['source']}）")
+    return version
+
+
+def _java_major(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 1 <= value <= 99 else None
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not re.fullmatch(r'\d+(?:[._]\d+)*', value):
+        return None
+    parts = re.split(r'[._]', value)
+    try:
+        major = int(parts[1]) if parts[0] == '1' and len(parts) > 1 else int(parts[0])
+    except (IndexError, ValueError):
+        return None
+    return major if 1 <= major <= 99 else None
+
+
+def _minecraft_version_tuple(value):
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r'\s*(\d+)\.(\d+)(?:\.(\d+))?\s*', value)
+    if match is None:
+        return None
+    return tuple(int(part or 0) for part in match.groups())
+
+
+def _minecraft_version_from_root_json(data):
+    if not isinstance(data, dict):
+        return None
+    for field in ('clientVersion', 'inheritsFrom', 'id'):
+        value = data.get(field)
+        if not isinstance(value, str):
+            continue
+        match = _MC_VERSION_TOKEN_RE.search(value)
+        if match is not None:
+            return match.group(1)
+    return None
+
+
+def _java_runtime_candidates(instance_dir, major):
+    """Return likely installed Java executables for the requested major."""
+    roots = []
+    for env_name in ('ProgramFiles', 'ProgramW6432', 'LOCALAPPDATA'):
+        value = os.environ.get(env_name)
+        if value:
+            roots.append(value)
+    patterns = []
+    for root in roots:
+        patterns.extend((
+            os.path.join(root, 'Eclipse Adoptium', f'jdk-{major}*',
+                         'bin', 'java.exe'),
+            os.path.join(root, 'Java', f'jdk-{major}*', 'bin', 'java.exe'),
+            os.path.join(root, 'Programs', 'Eclipse Adoptium',
+                         f'jdk-{major}*', 'bin', 'java.exe'),
+        ))
+
+    normalized_instance = os.path.abspath(os.path.normpath(instance_dir))
+    minecraft_dir = os.path.dirname(os.path.dirname(normalized_instance))
+    if os.path.basename(os.path.dirname(normalized_instance)).casefold() == 'versions':
+        patterns.append(os.path.join(
+            minecraft_dir, 'runtime', 'java-runtime-gamma', '**',
+            'bin', 'java.exe'))
+
+    found = []
+    seen = set()
+    for pattern in patterns:
+        for path in glob.glob(pattern, recursive=True):
+            canonical = os.path.normcase(os.path.abspath(path))
+            if canonical in seen or not os.path.isfile(path):
+                continue
+            seen.add(canonical)
+            found.append(os.path.abspath(path))
+    return sorted(found, key=lambda path: (len(path), path.casefold()))
+
+
+def _read_latest_log_java_major(path):
+    result = {
+        'status': 'missing',
+        'major': None,
+        'bytes_read': 0,
+        'truncated': False,
+        'error': None,
+    }
+    try:
+        with open(path, 'rb') as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if size <= MAX_LATEST_LOG_TAIL_BYTES:
+                handle.seek(0)
+                raw = handle.read(MAX_LATEST_LOG_TAIL_BYTES)
+                bytes_read = len(raw)
+                truncated = False
+            else:
+                handle.seek(0)
+                head = handle.read(LATEST_LOG_HEAD_BYTES)
+                tail_budget = MAX_LATEST_LOG_TAIL_BYTES - len(head)
+                handle.seek(max(len(head), size - tail_budget))
+                tail = handle.read(tail_budget)
+                raw = head + b'\n' + tail
+                bytes_read = len(head) + len(tail)
+                truncated = True
+    except FileNotFoundError:
+        return result
+    except OSError as exc:
+        result['status'] = 'unreadable'
+        result['error'] = str(exc)
+        return result
+
+    result['bytes_read'] = bytes_read
+    result['truncated'] = truncated
+    result['status'] = 'version_not_found'
+    text = raw.decode('utf-8-sig', errors='replace')
+    matches = list(_JAVA_VERSION_LOG_RE.finditer(text))
+    if matches:
+        result['major'] = _java_major(matches[-1].group('version'))
+        if result['major'] is not None:
+            result['status'] = 'ok'
+    return result
+
+
+def inspect_java_runtime_compatibility(instance_dir, minecraft_version=None):
+    """Read launcher metadata/log tail and report Java compatibility."""
+    instance_dir = os.path.abspath(os.path.normpath(instance_dir))
+    version_id = os.path.basename(instance_dir)
+    version_json_path = os.path.join(instance_dir, version_id + '.json')
+    latest_log_path = os.path.join(instance_dir, 'logs', 'latest.log')
+    report = {
+        'status': 'not_applicable',
+        'reason': None,
+        'is_incompatible': False,
+        'minecraft_version': minecraft_version,
+        'required_java_major': None,
+        'actual_java_major': None,
+        'recommended_java_major': None,
+        'recommended_java_path': None,
+        'version_json_path': version_json_path,
+        'version_json_status': 'missing',
+        'version_json_error': None,
+        'latest_log_path': latest_log_path,
+        'latest_log_status': 'missing',
+        'latest_log_error': None,
+        'latest_log_bytes_read': 0,
+        'latest_log_truncated': False,
+    }
+
+    version_data = _load_version_json_safely(version_json_path)
+    if version_data is not None:
+        report['version_json_status'] = 'ok'
+        java_version = version_data.get('javaVersion')
+        major_value = (
+            java_version.get('majorVersion')
+            if isinstance(java_version, dict) else None)
+        report['required_java_major'] = _java_major(major_value)
+        if report['minecraft_version'] is None:
+            report['minecraft_version'] = _minecraft_version_from_root_json(
+                version_data)
+    elif os.path.isfile(version_json_path):
+        report['version_json_status'] = 'invalid'
+
+    log_result = _read_latest_log_java_major(latest_log_path)
+    report['actual_java_major'] = log_result['major']
+    report['latest_log_status'] = log_result['status']
+    report['latest_log_error'] = log_result['error']
+    report['latest_log_bytes_read'] = log_result['bytes_read']
+    report['latest_log_truncated'] = log_result['truncated']
+
+    version_tuple = _minecraft_version_tuple(report['minecraft_version'])
+    requires_java_17 = (
+        report['required_java_major'] == 17
+        and version_tuple is not None
+        and (1, 17, 0) <= version_tuple <= (1, 20, 4)
+    )
+    if not requires_java_17:
+        report['reason'] = 'outside_java_17_range_or_requirement_unknown'
+        return report
+
+    report['recommended_java_major'] = 17
+    candidates = _java_runtime_candidates(instance_dir, 17)
+    if candidates:
+        report['recommended_java_path'] = candidates[0]
+    actual_major = report['actual_java_major']
+    if actual_major is None:
+        report['status'] = 'runtime_unknown'
+        report['reason'] = 'runtime_version_not_found'
+    elif actual_major == 17:
+        report['status'] = 'compatible'
+        report['reason'] = 'runtime_matches_requirement'
+    else:
+        report['status'] = 'incompatible'
+        report['reason'] = (
+            'runtime_newer_than_required'
+            if actual_major > 17 else 'runtime_older_than_required')
+        report['is_incompatible'] = True
+    return report
+
+
+def java_runtime_warning_lines(report):
+    """Return a clear Java compatibility warning for logs and blocking UI."""
+    if not isinstance(report, dict) or report.get('status') != 'incompatible':
+        return []
+    minecraft_version = report.get('minecraft_version') or '未知'
+    required_java = report.get('required_java_major') or 17
+    actual_java = report.get('actual_java_major') or '未知'
+    lines = [
+        (f"\n⚠️ Java 版本不相容：Minecraft {minecraft_version} / "
+         f"版本 JSON 要求 Java {required_java}，latest.log 顯示 Java {actual_java}。"),
+        "   這不是翻譯包或 Paxi 錯誤；翻譯器不會修改 Java 或遊戲實例。",
+        (f"   請先在啟動器將此實例固定為 Java {required_java}，"
+         "翻譯前會要求明確確認。"),
+    ]
+    java_path = report.get('recommended_java_path')
+    if java_path:
+        lines.append(f"   本機可用 Java {required_java}：{java_path}")
+    return lines
+
+
+def record_java_runtime_diagnostics(
+        app, instance_dir, minecraft_version=None):
+    """Store Java diagnostics for UI/packaging and emit warnings when needed."""
+    report = inspect_java_runtime_compatibility(
+        instance_dir, minecraft_version=minecraft_version)
+    app._java_runtime_compatibility_report = report
+    log = getattr(app, 'log', None)
+    if callable(log):
+        for warning_line in java_runtime_warning_lines(report):
+            log(warning_line)
+    return report
+
+
+def inspect_minecraft_language_assets(instance_dir):
+    """Inspect client language assets without changing the Minecraft instance."""
+    instance_dir = os.path.abspath(os.path.normpath(instance_dir))
+    version_id = os.path.basename(instance_dir)
+    versions_dir = os.path.dirname(instance_dir)
+    report = {
+        'status': 'not_version_instance',
+        'version_json_path': None,
+        'asset_index_id': None,
+        'asset_index_path': None,
+        'language_asset_count': 0,
+        'missing_objects': [],
+        'error': None,
+    }
+    if os.path.basename(versions_dir).casefold() != 'versions':
+        return report
+
+    version_json_path = os.path.join(instance_dir, version_id + '.json')
+    report['version_json_path'] = version_json_path
+    if not os.path.isfile(version_json_path):
+        report['status'] = 'missing_version_json'
+        return report
+
+    asset_index_id = None
+    current_version_id = version_id
+    current_json_path = version_json_path
+    visited = set()
+    for _depth in range(32):
+        normalized_id = current_version_id.casefold()
+        if normalized_id in visited:
+            report['status'] = 'invalid_version_json'
+            report['error'] = (
+                f'version inheritance cycle at {current_version_id}')
+            return report
+        visited.add(normalized_id)
+
+        try:
+            with open(current_json_path, 'r', encoding='utf-8-sig') as handle:
+                version_data = json.load(handle)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            report['status'] = 'invalid_version_json'
+            report['error'] = str(exc)
+            return report
+        if not isinstance(version_data, dict):
+            report['status'] = 'invalid_version_json'
+            report['error'] = (
+                f'version JSON must be an object: {current_json_path}')
+            return report
+
+        asset_index = version_data.get('assetIndex')
+        candidate_id = (
+            asset_index.get('id') if isinstance(asset_index, dict) else None)
+        if not isinstance(candidate_id, str) or not candidate_id.strip():
+            fallback_id = version_data.get('assets')
+            candidate_id = fallback_id if isinstance(fallback_id, str) else None
+        if isinstance(candidate_id, str) and candidate_id.strip():
+            asset_index_id = candidate_id.strip()
+            break
+
+        parent_id = version_data.get('inheritsFrom')
+        if not isinstance(parent_id, str) or not parent_id.strip():
+            break
+        parent_id = parent_id.strip()
+        if (parent_id in {'.', '..'}
+                or '/' in parent_id or '\\' in parent_id):
+            report['status'] = 'invalid_version_json'
+            report['error'] = f'invalid inherited version id: {parent_id}'
+            return report
+        current_version_id = parent_id
+        current_json_path = os.path.join(
+            versions_dir, parent_id, parent_id + '.json')
+        if not os.path.isfile(current_json_path):
+            report['status'] = 'missing_version_json'
+            report['error'] = (
+                f'inherited version JSON not found: {current_json_path}')
+            return report
+    else:
+        report['status'] = 'invalid_version_json'
+        report['error'] = 'version inheritance exceeds 32 levels'
+        return report
+
+    if not asset_index_id:
+        report['status'] = 'missing_asset_index_id'
+        return report
+
+    report['asset_index_id'] = asset_index_id
+    minecraft_dir = os.path.dirname(versions_dir)
+    asset_index_path = os.path.join(
+        minecraft_dir, 'assets', 'indexes', asset_index_id + '.json')
+    report['asset_index_path'] = asset_index_path
+    if not os.path.isfile(asset_index_path):
+        report['status'] = 'missing_asset_index'
+        return report
+
+    try:
+        with open(asset_index_path, 'r', encoding='utf-8-sig') as handle:
+            index_data = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        report['status'] = 'invalid_asset_index'
+        report['error'] = str(exc)
+        return report
+
+    objects = index_data.get('objects') if isinstance(index_data, dict) else None
+    if not isinstance(objects, dict):
+        report['status'] = 'invalid_asset_index'
+        report['error'] = 'asset index objects is not a mapping'
+        return report
+
+    language_assets = []
+    for name, metadata in objects.items():
+        normalized = name.replace('\\', '/').lower() if isinstance(name, str) else ''
+        if not (normalized == 'pack.mcmeta'
+                or (normalized.startswith('minecraft/lang/')
+                    and normalized.endswith('.json'))):
+            continue
+        language_assets.append((name, metadata))
+    report['language_asset_count'] = len(language_assets)
+
+    objects_dir = os.path.join(minecraft_dir, 'assets', 'objects')
+    for name, metadata in language_assets:
+        digest = metadata.get('hash') if isinstance(metadata, dict) else None
+        if not isinstance(digest, str) or len(digest) < 2:
+            object_path = None
+        else:
+            object_path = os.path.join(objects_dir, digest[:2], digest)
+        if object_path is None or not os.path.isfile(object_path):
+            report['missing_objects'].append({
+                'name': name,
+                'hash': digest,
+                'path': object_path,
+            })
+
+    if report['missing_objects']:
+        report['status'] = 'missing_objects'
+    elif not language_assets:
+        report['status'] = 'no_language_assets'
+    else:
+        report['status'] = 'ok'
+    return report
+
+
+def minecraft_language_asset_warning_lines(report):
+    """Return actionable read-only diagnostics for official language assets."""
+    status = report.get('status') if isinstance(report, dict) else None
+    if status == 'missing_objects':
+        missing = report.get('missing_objects') or []
+        missing_names = [
+            item.get('name', 'unknown')
+            for item in missing
+            if isinstance(item, dict)
+        ]
+        preview = ', '.join(missing_names[:3])
+        suffix = ' ...' if len(missing_names) > 3 else ''
+        return [
+            (f"\n⚠️ Minecraft 官方語言資產缺少 "
+             f"{len(missing_names)} 個物件：{preview}{suffix}"),
+            "   翻譯器不會修改或下載這些檔案；請用啟動器檢查並補齊遊戲資產。",
+        ]
+
+    abnormal_statuses = {
+        'missing_version_json',
+        'invalid_version_json',
+        'missing_asset_index_id',
+        'missing_asset_index',
+        'invalid_asset_index',
+        'no_language_assets',
+    }
+    if status not in abnormal_statuses:
+        return []
+    detail = report.get('error') if isinstance(report, dict) else None
+    detail_suffix = f"（{detail}）" if detail else ''
+    return [
+        f"\n⚠️ Minecraft 官方語言資產檢查異常：{status}{detail_suffix}",
+        "   翻譯器不會修改或下載遊戲檔；請用啟動器驗證遊戲檔案。",
+    ]
+
+
+def should_scan_translation_archive(
+        mod_dir, path, server_mode=False, allow_root_jar=False):
     """Return whether a jar/zip is a real translation source for this modpack."""
     parts = _rel_parts(mod_dir, path)
     if not parts:
@@ -141,6 +915,10 @@ def should_scan_translation_archive(mod_dir, path):
         or '/paxi/datapacks/' in rel
     )
     if ext == '.jar':
+        if (len(parts) == 1
+                and not allow_root_jar
+                and is_minecraft_version_root_jar(mod_dir, path)):
+            return False
         return len(parts) == 1 or top == 'mods' or is_pack_archive
     if ext == '.zip':
         return is_pack_archive
@@ -512,13 +1290,13 @@ def scan_single_jar(self, path):
                     self.analyzed_book_text_repairs[path] = book_text_repairs
 
             class_texts = {}
-            # 用 _analyze_task 開頭快照的值，不在掃描執行緒裡碰 tkinter 變數。
-            # class 硬編碼只掃 item/block tooltip，輸出階段仍會避開高風險 JAR。
+            # Only item tooltip classes are eligible. Structural, API and event
+            # classes remain excluded because modifying them can break startup.
             scan_classes = (
                 scope_mod_lang
                 and not server_mode
-                and getattr(self, "_scan_class_tooltip_patch", True)
-                and getattr(self, "_scan_output_mode", "resource_pack") in ("hybrid", "jar_patch")
+                and getattr(self, "_scan_class_tooltip_patch", False)
+                and getattr(self, "_scan_output_mode", "hybrid") == "hybrid"
             )
             if scan_classes:
                 for idx, info in enumerate(infos):
@@ -526,13 +1304,7 @@ def scan_single_jar(self, path):
                         break
                     fn = info.filename
                     fn_lower = fn.lower()
-                    if not fn_lower.endswith('.class'):
-                        continue
-                    # Only item classes are patched (tooltip 文字主要所在處)。
-                    # Block/config/datagen/recipe/world classes often contain JVM
-                    # invokedynamic string recipes (\x01 placeholders);
-                    # translating those can make the mod fail before Minecraft starts.
-                    if '/item/' not in fn_lower:
+                    if not fn_lower.endswith('.class') or '/item/' not in fn_lower:
                         continue
                     if any(skip in fn_lower for skip in (
                             '/api/', '/hooks/', '/natives/', '/event/',
@@ -540,16 +1312,16 @@ def scan_single_jar(self, path):
                             '/test/', '/tests/')):
                         continue
                     try:
-                        with jar.open(info) as f:
-                            class_data = f.read()
-                        strings = []
-                        for entry in self._class_utf8_entries(class_data):
-                            text = entry["text"]
-                            if self._is_hardcoded_lore_string(text):
-                                strings.append(text)
+                        with jar.open(info) as class_file:
+                            class_data = class_file.read()
+                        strings = [
+                            entry['text']
+                            for entry in self._class_utf8_entries(class_data)
+                            if self._is_hardcoded_lore_string(entry['text'])
+                        ]
                         if strings:
                             class_texts[fn] = sorted(set(strings))
-                    except (OSError, zipfile.BadZipFile):
+                    except (OSError, zipfile.BadZipFile, KeyError, ValueError):
                         continue
             if class_texts:
                 with self._jar_lock:
@@ -594,21 +1366,52 @@ def run_analyze_task(self, mod_dir):
 
 def run_analyze_task_impl(self, mod_dir):
     self.analyzed_mc_dir = mod_dir          # 記錄本次分析的根目錄
-    # 伺服器模式偵測：根目錄有 server.properties 即視為 dedicated server
-    self._server_mode = os.path.exists(os.path.join(mod_dir, 'server.properties'))
+    detected_version = sync_detected_pack_formats(self, mod_dir)
+    if (detected_version is None
+            and getattr(self, '_version_detection_required', True)):
+        raise RuntimeError(
+            "無法自動判定 Minecraft 版本；請選擇單一版本的遊戲實例資料夾。")
+    record_java_runtime_diagnostics(
+        self, mod_dir, minecraft_version=detected_version)
+    # server.properties 只是候選訊號；允許覆寫 JAR 前仍須使用者明確確認。
+    server_candidate = (
+        os.path.isfile(os.path.join(mod_dir, 'server.properties'))
+        and not is_minecraft_client_version_directory(mod_dir)
+    )
+    server_opt_in = getattr(self, '_server_mode_requested', None)
+    if server_candidate and server_opt_in is None:
+        server_opt_in = self._ask_proceed_from_thread(
+            "伺服器模式安全確認",
+            "偵測到 server.properties。伺服器模式可能輸出 mods/*.jar；"
+            "只有來源確定是 dedicated server 且已停止伺服器時才可啟用。\n\n"
+            "要明確啟用伺服器模式嗎？")
+    self._server_mode = detect_minecraft_server_mode(
+        mod_dir, explicit_opt_in=bool(server_opt_in))
     if self._server_mode:
-        self.log("\n🖥️ 偵測到 server.properties → 進入「伺服器模式」")
+        self.log("\n🖥️ 已確認 dedicated server，進入「伺服器模式」")
+    elif server_candidate:
+        self.log("\n🛡️ 偵測到 server.properties，但未明確啟用伺服器模式；維持客戶端 JAR 安全鎖。")
         self.log("   翻譯範圍：FTB 任務書(.snbt)、advancement 顯示文字、Apotheosis 命名表")
         self.log("   （這些由伺服器同步給所有玩家，不需要玩家裝任何補丁）")
         self.log("   自動跳過：mod 語言檔/手冊/書本（dedicated server 只認 en_us，翻了無效）、")
         self.log("   class 硬編碼修補（伺服器端壞一個 class = 全服崩潰，風險過高）")
+    else:
+        asset_report = inspect_minecraft_language_assets(mod_dir)
+        self._minecraft_language_asset_report = asset_report
+        for warning_line in minecraft_language_asset_warning_lines(asset_report):
+            self.log(warning_line)
     self._scan_process_mode = self.process_mode_var.get() if hasattr(self, "process_mode_var") else "append"
     self._scan_output_mode = self.output_mode_var.get() if hasattr(self, "output_mode_var") else "hybrid"
     self._scan_class_tooltip_patch = bool(
-        getattr(getattr(self, "class_tooltip_patch_var", None), "get", lambda: True)())
+        getattr(getattr(self, "class_tooltip_patch_var", None), "get", lambda: False)())
     self._scan_scope_mod_lang = self.scope_mod_lang_var.get()
     self._scan_scope_books = self.scope_books_var.get()
     self._scan_scope_quests = self.scope_quests_var.get()
+    self._allow_root_jar = bool(
+        not self._server_mode
+        and self._scan_output_mode == 'hybrid'
+        and self._scan_class_tooltip_patch)
+    allow_root_jar = self._allow_root_jar
     process_mode = self._scan_process_mode
     scope_mod_lang = self._scan_scope_mod_lang
     scope_books = self._scan_scope_books
@@ -646,11 +1449,15 @@ def run_analyze_task_impl(self, mod_dir):
             ext       = file.lower().rsplit('.', 1)[-1] if '.' in file else ''
 
             if ext == 'jar':
-                if should_scan_translation_archive(mod_dir, path):
+                if should_scan_translation_archive(
+                        mod_dir, path, server_mode=self._server_mode,
+                        allow_root_jar=allow_root_jar):
                     jar_paths.append(path)
 
             elif ext == 'zip':
-                if not should_scan_translation_archive(mod_dir, path):
+                if not should_scan_translation_archive(
+                        mod_dir, path, server_mode=self._server_mode,
+                        allow_root_jar=allow_root_jar):
                     continue
                 in_dp = (
                     rel_norm.startswith('datapacks/')

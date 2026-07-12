@@ -59,7 +59,10 @@ from core.config_store import (
     deobfuscate as core_deobfuscate,
 )
 from core.json_utils import clean_json_text as core_clean_json_text
-from core.translation_flow import run_translate_task
+from core.translation_flow import (
+    POST_TRANSLATION_RESCUE_LIMIT,
+    run_translate_task,
+)
 from core.jar_patcher import (
     build_class_inject_for_jar as core_build_class_inject_for_jar,
     generate_class_patch_jars as core_generate_class_patch_jars,
@@ -72,6 +75,7 @@ from core.jar_patcher import (
     write_openloader_resource_overlay as core_write_openloader_resource_overlay,
 )
 from translation_cache import (
+    cache_snapshot,
     load_translation_cache,
     review_and_fix_cache,
     save_translation_cache,
@@ -83,6 +87,27 @@ from translation_packager import (
     sanitize_text,
     sanitize_value,
 )
+
+
+def _bounded_post_translation_engine_items(app, items):
+    """Return deterministic rescue work within the shared engine-call budget."""
+    unique_items = sorted(set(items))
+    budget = max(0, min(
+        POST_TRANSLATION_RESCUE_LIMIT,
+        int(getattr(
+            app, '_post_translation_rescue_budget',
+            POST_TRANSLATION_RESCUE_LIMIT)),
+    ))
+    selected = unique_items[:budget]
+    omitted = len(unique_items) - len(selected)
+    if hasattr(app, '_post_translation_rescue_budget'):
+        app._post_translation_rescue_budget = budget - len(selected)
+        app._post_translation_rescue_budget_managed = True
+    if omitted:
+        app.log(
+            f"ℹ️  補翻引擎工作上限 {POST_TRANSLATION_RESCUE_LIMIT} 筆；"
+            f"另 {omitted} 筆保留原文，避免完成後長時間卡住。")
+    return selected
 
 try:
     from opencc import OpenCC
@@ -126,6 +151,8 @@ class ModTranslatorApp:
     _RE_BRACED_LANG_KEY = re.compile(
         r'^\{[^{}\s]+\}(?:(?:\\n|\\\\n)\{[^{}\s]+\})*$',
         re.IGNORECASE)
+    _RE_PATCHOULI_CONTROL_TOKEN = re.compile(
+        r'^#[A-Za-z_][A-Za-z0-9_]*#?$')
     _RE_COLOR      = re.compile(r'^#?[0-9a-fA-F]{6,8}$')
     _RE_ALLCAPS    = re.compile(r'^[A-Z0-9_]+$')
     _RE_NONWORD    = re.compile(r'^[\W_0-9]+$')
@@ -1137,7 +1164,7 @@ class ModTranslatorApp:
                       font=("微軟正黑體", 15),
                       relief="flat", bd=0, cursor="hand2",
                       width=3).pack(side=tk.LEFT, padx=(0, 10))
-        tk.Label(sidebar, text="v1.2.0", bg=panel2, fg=muted,
+        tk.Label(sidebar, text="v1.2.2", bg=panel2, fg=muted,
                  font=("Consolas", 9), anchor="w").pack(
                      side=tk.BOTTOM, fill=tk.X, padx=22, pady=(0, 10))
 
@@ -1184,7 +1211,7 @@ class ModTranslatorApp:
         self.rp_name_var = tk.StringVar(value="Auto_Translated_Mods_zh_tw")
         self.datapack_name_var = tk.StringVar(value="")
         self.output_mode_var = tk.StringVar(value="hybrid")
-        self.mc_version_var = tk.StringVar(value="1.20.1")
+        self.mc_version_var = tk.StringVar(value="等待自動判定")
         self.datapack_format_var = tk.IntVar(value=15)
         self.process_mode_var = tk.StringVar(value="append")
         self.retry_count_var = tk.IntVar(value=3)
@@ -1237,7 +1264,7 @@ class ModTranslatorApp:
         label(project, 3, "輸出模式")
         self.output_mode_var.set("hybrid")
         mode_badge = tk.Label(
-            project, text="混合安全模式", bg="#0b6c70", fg=text,
+            project, text="混合模式（自動輸出）", bg="#0b6c70", fg=text,
             font=("微軟正黑體", 9, "bold"), padx=18, pady=6,
             anchor="center")
         mode_badge.grid(row=3, column=1, columnspan=3, sticky="ew", pady=6, padx=(8, 6))
@@ -1248,14 +1275,12 @@ class ModTranslatorApp:
         version_row = tk.Frame(project, bg=panel)
         version_row.grid(row=5, column=1, columnspan=3, sticky="ew", pady=4, padx=(8, 8))
         version_row.columnconfigure(0, weight=1)
-        self.mc_version_cb = ttk.Combobox(
+        tk.Label(
             version_row, textvariable=self.mc_version_var,
-            values=list(self.MC_PACK_FORMATS.keys()), state="readonly",
-            font=("Consolas", 9), width=16, style="Dark.TCombobox")
-        self.mc_version_cb.grid(row=0, column=0, sticky="w")
-        self.mc_version_cb.bind("<<ComboboxSelected>>", self._on_mc_version_change)
+            bg=entry_bg, fg=cyan, font=("Consolas", 9, "bold"),
+            padx=12, pady=5, anchor="w").grid(row=0, column=0, sticky="w")
         self.pack_format_hint = tk.Label(
-            version_row, text="", bg=panel, fg=muted,
+            version_row, text="選擇來源後按分析，由程式自動判定", bg=panel, fg=muted,
             font=("微軟正黑體", 8), anchor="w")
         self.pack_format_hint.grid(row=0, column=1, sticky="w", padx=(12, 0))
 
@@ -1311,8 +1336,8 @@ class ModTranslatorApp:
             ("全域翻譯記憶池", self.global_memory_var),
             ("嚴格白名單防爆", self.strict_whitelist_var),
             ("只補缺漏 + 更新偵測", self.update_detect_var),
-            ("低風險 class tooltip", self.class_tooltip_patch_var),
-            ("大型 JAR 備份", self.include_large_backups_var),
+            ("低風險 class/JAR 修補", self.class_tooltip_patch_var),
+            ("伺服器大型 JAR 備份", self.include_large_backups_var),
         ]:
             tk.Checkbutton(safety_row, text=caption, variable=var,
                            bg=panel, fg=text, activebackground=panel,
@@ -1637,13 +1662,16 @@ class ModTranslatorApp:
                     self.scope_mod_lang_var, self.scope_books_var,
                     self.scope_quests_var, self.datapack_output_var,
                     self.global_memory_var, self.strict_whitelist_var,
-                    self.update_detect_var, self.auto_normalize_endpoint_var]:
+                    self.update_detect_var, self.class_tooltip_patch_var,
+                    self.auto_normalize_endpoint_var]:
             _sv.trace_add('write', self._schedule_save)
         self.mc_version_var.trace_add('write', self._on_mc_version_change)
         for _sv in [self.ai_provider_menu_var, self.ai_provider_var, self.ai_model_var, self.ai_base_url_var,
                     self.ai_api_key_var, self.ai_api_keys_var, self.engine_var]:
             _sv.trace_add('write', self._refresh_api_summary)
         self.output_mode_var.trace_add('write', self._refresh_output_summary)
+        self.class_tooltip_patch_var.trace_add(
+            'write', self._refresh_output_summary)
         self.datapack_output_var.trace_add('write', self._refresh_output_summary)
 
     def _set_summary_card(self, key, value=None, sub=None, color=None):
@@ -1666,20 +1694,21 @@ class ModTranslatorApp:
             pass
 
     def _output_mode_summary(self):
-        mode = self.output_mode_var.get() if hasattr(self, "output_mode_var") else "hybrid"
-        if mode == "jar_patch":
-            return "JAR 直接套用", "語言：zh_tw\n輸出：模組語言包 ZIP"
-        if mode == "hybrid":
-            return "混合安全模式", "語言：zh_tw\n輸出：資源包 + 必要補丁"
-        return "安全資源包", "語言：zh_tw\n輸出：Resource Pack ZIP"
+        class_patch = bool(getattr(
+            getattr(self, 'class_tooltip_patch_var', None),
+            'get', lambda: False)())
+        suffix = " + 低風險 class/JAR 補丁" if class_patch else ""
+        return "混合模式", f"語言：zh_tw\n輸出：資源包 + 設定覆蓋{suffix}"
 
     def _refresh_output_summary(self, *args):
         value, sub = self._output_mode_summary()
         self._set_summary_card("output", value, sub, self.C_TEXT)
 
     def _on_mc_version_change(self, *args):
-        version = self.mc_version_var.get().strip() if hasattr(self, "mc_version_var") else "1.20.1"
-        formats = self.MC_PACK_FORMATS.get(version, self.MC_PACK_FORMATS["1.20.1"])
+        version = self.mc_version_var.get().strip() if hasattr(self, "mc_version_var") else ""
+        formats = self.MC_PACK_FORMATS.get(version)
+        if formats is None:
+            return
         if hasattr(self, "pack_format_var"):
             self.pack_format_var.set(formats["rp"])
         if hasattr(self, "datapack_format_var"):
@@ -2276,13 +2305,15 @@ class ModTranslatorApp:
     def show_install_guide(self):
         """輸出檔案安裝說明：依目前輸出模式說明每個產物該放哪、要不要解壓。"""
         rp_name = (self.rp_name_var.get().strip() or "翻譯包") if hasattr(self, "rp_name_var") else "翻譯包"
+        mode = (self.output_mode_var.get()
+                if hasattr(self, "output_mode_var") else "hybrid")
         server_note = (
             "伺服器（服務端）翻譯\n"
             "────────────────────────────\n"
             "• 把「來源資料夾」指到伺服器目錄（含 server.properties 那層）再分析，\n"
-            "  工具會自動進入伺服器模式：只翻任務書、advancement 顯示文字、\n"
+            "  並在安全確認視窗明確啟用伺服器模式：只翻任務書、advancement 顯示文字、\n"
             "  Apotheosis 命名表（這些由伺服器同步，玩家不用裝補丁就看得到中文）。\n"
-            "• 伺服器模式輸出「JAR 直接套用」合併包（不產生客戶端資源包）：\n"
+            "• 只有伺服器模式可能輸出 JAR 套用包（不產生客戶端資源包）：\n"
             "  停服 → 整包解壓覆蓋到伺服器根目錄（mods/ + config/）→ 重啟伺服器。\n"
             "• 小型設定/任務檔會附 _backups/；大型 JAR 備份可在「安全增量」勾選啟用。\n"
             "• 伺服器模式不做 class 硬編碼修補（壞一個 class 會全服崩潰，故關閉）；\n"
@@ -2292,21 +2323,32 @@ class ModTranslatorApp:
         common = server_note + (
             "通用觀念\n"
             "────────────────────────────\n"
-            "• 客戶端預設是安全資源包：ZIP 放進 resourcepacks/ 並啟用即可。\n"
+            "• 固定使用混合模式：語言與手冊走資源包，設定走安全覆蓋。\n"
+            "• 勾選『低風險 class/JAR 修補』時會另出補丁 ZIP，內含原始備份。\n"
+            "• 資源包 ZIP 放進 resourcepacks/ 並啟用即可。\n"
             "  若輸出資料夾就是整合包根目錄或 resourcepacks/，工具會自動啟用。\n"
-            "• 「需要解壓」的 ZIP：用 7-Zip / WinRAR 解壓後，把裡面的資料夾\n"
-            "  （mods/、config/、defaultconfigs/）覆蓋到遊戲實例的根目錄。\n"
-            "• 若有啟用「大型 JAR 備份」，覆蓋 mods/ 的 ZIP 會附 _backups/ 可還原。\n\n"
+            "• 安全覆蓋 ZIP 只能把 config/、defaultconfigs/、_translator/\n"
+            "  解壓到遊戲根目錄；若看見 mods/*.jar，請勿套用。\n\n"
         )
-        detail = (
-            "目前模式：安全資源包\n"
-            "────────────────────────────\n"
-            f"① {rp_name}.zip\n"
-            "   → 放進 resourcepacks/，遊戲內啟用；輸出到整合包內時會自動啟用。\n"
-            "   → 若 ZIP 內含 config/ 或 defaultconfigs/，再解壓這些資料夾到根目錄。\n\n"
-            "② 混合模式另產生的 Class 補丁（若有）才需要解壓覆蓋 mods/。\n"
-            "   預設不修改 .class；少數寫死在程式碼內的英文會保留，避免啟動崩潰。\n"
-        )
+        if mode == "jar_patch":
+            detail = (
+                "目前模式：安全覆蓋套用\n"
+                "────────────────────────────\n"
+                f"① {rp_name.replace('.zip', '')}_模組語言包.zip\n"
+                "   → 解壓到遊戲根目錄，只會套用 Paxi/OpenLoader 與設定檔。\n"
+                "   → 無安全覆蓋通道的文字保留原文，不會重建模組 JAR。\n"
+                "   → 若有 TRANSLATOR_RUNTIME_WARNING.txt，先依內容修正 Java。\n"
+            )
+        else:
+            detail = (
+                "目前模式：混合模式\n"
+                "────────────────────────────\n"
+                f"① {rp_name}.zip\n"
+                "   → 放進 resourcepacks/，遊戲內啟用；輸出到整合包內時會自動啟用。\n"
+                "   → 若 ZIP 內含 config/ 或 defaultconfigs/，再解壓這些資料夾到根目錄。\n\n"
+                "② 若啟用低風險 class/JAR 修補，將 Class 補丁 ZIP 解壓到實例根目錄。\n"
+                "   原始 mods/ 與版本 JAR 會保存在補丁內的 _backups/。\n"
+            )
         self._show_text_dialog("📦 輸出檔案安裝說明", common + detail)
 
     def _show_text_dialog(self, title, content):
@@ -2345,9 +2387,9 @@ class ModTranslatorApp:
     def show_about(self):
         msg = (
             "Minecraft 模組翻譯器\n"
-            "版本：v1.2.0\n"
+            "版本：v1.2.2\n"
             "預設模型：DeepSeek V4 Flash Free (OpenRouter)\n"
-            "支援：JAR 直接套用、自動判定、全域記憶池與多 API 模型"
+            "支援：固定混合模式、自動判定、全域記憶池與多 API 模型"
         )
         self.log("INFO  已開啟關於資訊。")
         messagebox.showinfo("關於", msg)
@@ -3052,13 +3094,13 @@ class ModTranslatorApp:
         self.output_mode_var = tk.StringVar(value="hybrid")
         tk.Label(
             mode_frame,
-            text="📦  混合安全模式  （資源包 + 低風險硬編碼補丁）",
+            text="📦  混合模式  （資源包 + 設定覆蓋 + 可選 class/JAR）",
             bg=self.C_SURFACE, fg=self.C_ACCENT,
             font=("微軟正黑體", 9, "bold")
         ).grid(row=0, column=0, sticky="w", pady=2)
         self.output_mode_hint = tk.Label(
             mode_frame,
-            text="  安全優先：輸出標準資源包；不重包 JAR，不修改 .class",
+            text="  自動輸出資源與設定；低風險 class/JAR 由單一選項控制",
             bg=self.C_SURFACE, fg=self.C_MUTED, font=("微軟正黑體", 8), anchor="w")
         self.output_mode_hint.grid(row=1, column=0, sticky="w")
 
@@ -3480,23 +3522,23 @@ class ModTranslatorApp:
                           "③ 預設不改 JAR，啟動崩潰風險最低"),
         "hybrid": ("輸出後怎麼用：\n"
                    "① 先啟用資源包 ZIP\n"
-                   "② 只有偵測到安全的硬編碼 tooltip 時，才另產生 Class 補丁\n"
-                   "③ 補丁 ZIP 內含 _backups/，可還原原始 JAR"),
+                   "② config/defaultconfigs 再解壓到遊戲根目錄\n"
+                   "③ 若有 Class 補丁 ZIP，再解壓至實例根目錄；原檔在 _backups/"),
         "jar_patch": ("輸出後怎麼用：\n"
-                      "① 模組語言包 ZIP → 解壓，把 mods/、config/ 覆蓋到遊戲目錄\n"
-                      "② 小型設定會附 _backups/；大型 JAR 備份可在安全增量啟用\n"
-                      "③ 為避免崩潰，此模式不修補 .class 硬編碼字串"),
+                      "① 安全覆蓋 ZIP 解壓到遊戲根目錄\n"
+                      "② 只含 Paxi/OpenLoader、config、defaultconfigs\n"
+                      "③ 絕不含 mods/*.jar，也不修改 .class"),
     }
 
     def _on_output_mode_change(self):
         mode = self.output_mode_var.get()
-        if mode not in self.SIDEBAR_GUIDE_TEXT:
+        if mode != "hybrid":
             mode = "hybrid"
             self.output_mode_var.set(mode)
         hints = {
             "resource_pack": "  安全優先：輸出標準資源包；不重包 JAR，不修改 .class",
-            "hybrid": "  資源包 + 可選 class 補丁；只修補低風險 item/block tooltip",
-            "jar_patch": "  直接輸出可覆蓋的模組語言包；只注入語言/書本/設定，不修改 .class",
+            "hybrid": "  自動輸出資源/設定；可選低風險 class/JAR 補丁",
+            "jar_patch": "  Paxi/OpenLoader + 設定覆蓋；絕不輸出 mods/*.jar 或修改 .class",
         }
         self.output_mode_hint.config(text=hints[mode])
         if hasattr(self, "sidebar_guide_label"):
@@ -3999,42 +4041,44 @@ class ModTranslatorApp:
         return 0
 
     def save_cache(self, light=False):
-        """原子寫入：先寫 .tmp，成功後重命名覆蓋正式檔案，並保留一份 .bak 備份。
-        多執行緒安全：使用 _cache_lock，若已有執行緒在寫入則直接返回。
+        """Persist cache progress without making checkpoints run full review.
 
-        light=True（翻譯途中每 15 秒的自動存檔）只寫 .pkl 快速檔，
-        並只把「本場新增」的條目併入記憶池（不落盤）——
-        完整的 JSON/備份/記憶池落盤留給任務結束時的 full save，
-        避免每 15 秒重寫 14MB 檔案 + 對整個快取重跑 OpenCC 驗證。"""
+        SQLite checkpoints flush pending rows. The in-memory fallback uses an
+        atomic pkl replacement. A full save additionally merges and persists
+        the global translation memory pool.
+        """
         if not self._cache_lock.acquire(blocking=False):
             return   # 已有執行緒在儲存，略過
         try:
+            session_keys = set(
+                getattr(self, "_session_translated_keys", set()) or set())
             if light:
-                # 沒有新條目就不要每 15 秒重寫整顆 pkl（長任務累積數 GB 無謂 IO）
-                if len(self.translation_cache) == getattr(self, "_last_light_len", -1):
-                    self.last_save_time = time.time()
-                    return
-                cache_file = self._current_cache_file()
-                if hasattr(self.translation_cache, "sync"):
-                    self.translation_cache.sync()
+                sync_cache = getattr(self.translation_cache, "sync", None)
+                if callable(sync_cache):
+                    # 覆寫既有 key 不會改變 len；checkpoint 仍須 flush pending。
+                    sync_cache()
                 else:
-                    tmp_pkl = cache_file + '.pkl.tmp'
-                    with open(tmp_pkl, 'wb') as f:
-                        pickle.dump(sanitize_value(dict(self.translation_cache)), f,
-                                    protocol=pickle.HIGHEST_PROTOCOL)
-                    os.replace(tmp_pkl, cache_file + '.pkl')
+                    current_len = len(self.translation_cache)
+                    # 記憶體 fallback 沒有 dirty revision；本輪有翻譯時不能
+                    # 用長度相同推論內容未被覆寫。
+                    if (current_len != getattr(self, "_last_light_len", -1)
+                            or session_keys):
+                        cache_file = self._current_cache_file()
+                        tmp_pkl = cache_file + '.pkl.tmp'
+                        with open(tmp_pkl, 'wb') as f:
+                            pickle.dump(sanitize_value(dict(self.translation_cache)), f,
+                                        protocol=pickle.HIGHEST_PROTOCOL)
+                        os.replace(tmp_pkl, cache_file + '.pkl')
                 self._last_light_len = len(self.translation_cache)
                 self.last_save_time = time.time()
             else:
                 self.last_save_time = save_translation_cache(
                     self._current_cache_file(), self.translation_cache)
             if self.global_memory_var.get():
-                session_keys = set(
-                    getattr(self, "_session_translated_keys", set()) or set())
                 if light:
                     # Mid-run checkpoints must stay cheap. Per-entry OpenCC and
                     # validation over tens of thousands of keys made pause take
-                    # minutes. The shelve cache is already durable; merge memory
+                    # minutes. SQLite rows are already durable; merge memory
                     # once during the normal stage-2.5 full save.
                     if session_keys:
                         self._memory_pool_dirty = True
@@ -4051,10 +4095,11 @@ class ModTranslatorApp:
                     # still populate the global memory pool on final completion.
                     candidate_keys = session_keys | set(
                         getattr(self, "_analysis_unique_strings", set()) or set())
-                    for source in candidate_keys:
+                    cached_candidates = cache_snapshot(
+                        self.translation_cache, candidate_keys)
+                    for source, target in cached_candidates.items():
                         if source in merged:
                             continue
-                        target = self.translation_cache.get(source)
                         before = self.translation_memory.get(source)
                         if (self._add_memory_pair(source, target)
                                 and before != self.translation_memory.get(source)):
@@ -4084,13 +4129,13 @@ class ModTranslatorApp:
         3. 記錄統計資訊至日誌
         注意：先取快照再遍歷，防止遍歷期間 worker 執行緒同時修改字典。"""
         self.log("\n--- 快取繁體中文複查 ---")
+        if (getattr(self, "stop_requested", False)
+                or getattr(self, "pause_requested", False)):
+            self.log("ℹ️ 已取消快取複查，保留目前翻譯進度。")
+            return
         session_keys = set(getattr(self, "_session_translated_keys", set()) or set())
         if hasattr(self.translation_cache, "bulk_update"):
-            snapshot = {
-                key: self.translation_cache.get(key)
-                for key in session_keys
-                if key in self.translation_cache
-            }
+            snapshot = cache_snapshot(self.translation_cache, session_keys)
             if not snapshot:
                 self.log("ℹ️ 本輪沒有新增快取條目，跳過全量複查。")
                 return
@@ -4098,7 +4143,13 @@ class ModTranslatorApp:
             snapshot = dict(self.translation_cache)   # 快照，避免遍歷中被修改
         new_cache, stats = review_and_fix_cache(
             snapshot, self._RE_FORMAT, self._to_traditional,
-            self._is_valid_trad_translation)
+            self._is_valid_trad_translation,
+            should_cancel=lambda: (
+                getattr(self, "stop_requested", False)
+                or getattr(self, "pause_requested", False)))
+        if stats.get("cancelled"):
+            self.log("ℹ️ 已中止快取複查；未套用部分掃描結果。")
+            return
         # Patchouli 巨集治癒：把歷史翻譯弄壞的 $ ( ) / !~() 修回 $()
         macro_fixed = 0
         for k, v in new_cache.items():
@@ -4182,11 +4233,9 @@ class ModTranslatorApp:
                 self.ai_login_url_var.set(config.get('ai_login_url', self.ai_login_url_var.get()))
                 self.engine_var.set(self._normalize_engine_route_value(config.get('engine', 'market_ai')))
                 self.local_url_var.set(config.get('local_url', 'http://localhost:1234/v1/chat/completions'))
-                self.mc_version_var.set(config.get('mc_version', '1.20.1'))
-                self.pack_format_var.set(config.get('pack_format', 15))
-                self.datapack_format_var.set(config.get('datapack_format', 15))
+                self.mc_version_var.set('等待自動判定')
                 self.workers_var.set(config.get('workers', 8))
-                self.output_mode_var.set(config.get('output_mode', 'hybrid'))
+                self.output_mode_var.set('hybrid')
                 saved_process_mode = config.get('process_mode', 'append')
                 if saved_process_mode == 'force':
                     saved_process_mode = 'append'
@@ -4201,7 +4250,8 @@ class ModTranslatorApp:
                 self.strict_whitelist_var.set(config.get('strict_whitelist', True))
                 self.update_detect_var.set(config.get('update_detect', True))
                 self.include_large_backups_var.set(config.get('include_large_backups', False))
-                self.class_tooltip_patch_var.set(config.get('class_tooltip_patch', True))
+                self.class_tooltip_patch_var.set(
+                    config.get('class_tooltip_patch', True))
                 self.auto_normalize_endpoint_var.set(config.get('auto_normalize_endpoint', True))
                 self._on_mc_version_change()
                 self._on_engine_change()
@@ -4390,6 +4440,8 @@ class ModTranslatorApp:
         text = text.strip()
         if len(text) <= 1:
             return False
+        if self._RE_PATCHOULI_CONTROL_TOKEN.fullmatch(text):
+            return False
         if text.lower() in {'true', 'false', 'null', 'none', 'default'}:
             return False
         if self._RE_NUMBER.match(text):
@@ -4492,6 +4544,9 @@ class ModTranslatorApp:
     def _retranslate_mixed(self, mixed):
         """用目前（AI）引擎重翻混英條目；任何一筆失敗就還原原譯文，
         只會更好、不會更差。回傳改善筆數。"""
+        mixed = _bounded_post_translation_engine_items(self, mixed)
+        if not mixed:
+            return 0
         backup = {s: self.translation_cache[s] for s in mixed if s in self.translation_cache}
         for s in mixed:
             self.translation_cache.pop(s, None)
@@ -4539,6 +4594,7 @@ class ModTranslatorApp:
             return 0
         need = [p for p in sorted(phrases)
                 if not self._cache_has_usable_translation(p) and self.get_translation(p) == p]
+        need = _bounded_post_translation_engine_items(self, need)
         if need:
             self.log(f"   抽出 {len(phrases)} 個英文片語，其中 {len(need)} 個送翻")
             self.batch_translate_missing(need)
@@ -4599,9 +4655,10 @@ class ModTranslatorApp:
                     seg_need.add(t)
         if not plans:
             return 0
+        seg_need = _bounded_post_translation_engine_items(self, seg_need)
         if seg_need:
             self.log(f"   切出 {len(seg_need)} 個純文字段送翻（格式碼不經過引擎）")
-            self.batch_translate_missing(sorted(seg_need))
+            self.batch_translate_missing(seg_need)
         rescued = 0
         for s, parts in plans.items():
             out = []
@@ -4777,9 +4834,11 @@ class ModTranslatorApp:
     def _repair_structured_book_json_output(
             self, source_data, zh_base, merged_data, process_book_data,
             path_label=""):
-        """Before packaging a book/manual JSON, retry visible fields that are
-        still untranslated. This prevents English text from being written into
-        zh_tw/en_us fallback overlays while preserving technical JSON fields.
+        """Report untranslated book fields without doing network I/O.
+
+        Translation and retries finish before packaging. Retrying here once per
+        JSON made archive generation non-deterministic and could stall for a
+        provider timeout after the progress bar had already reached 100%.
         """
         missing = self._collect_untranslated_visible_json_strings(
             source_data, merged_data, strict_context=True)
@@ -4788,19 +4847,10 @@ class ModTranslatorApp:
             return merged_data
 
         label = f" {path_label}" if path_label else ""
-        self.log(f"  ⚠️{label}: 手冊 JSON 尚有 {len(missing):,} 個可見欄位未翻，輸出前補翻一次")
-        self.batch_translate_missing(missing, _force_chunk_size=24)
-
-        repaired = merge_structured_json_with_existing_zh(
-            source_data, zh_base, process_book_data, self._to_traditional,
-            value_needs_update=self._lang_value_needs_update)
-        remaining = sorted(set(self._collect_untranslated_visible_json_strings(
-            source_data, repaired, strict_context=True)))
-        if remaining:
-            self.log(
-                f"  ⚠️{label}: 補翻後仍有 {len(remaining):,} 個手冊欄位未翻，"
-                "已保留結構並交由失敗報告追蹤")
-        return repaired
+        self.log(
+            f"  ⚠️{label}: 手冊 JSON 尚有 {len(missing):,} 個可見欄位未翻；"
+            "打包階段不發送網路翻譯，已保留原值並交由失敗報告追蹤")
+        return merged_data
 
     def _book_text_translatable_paragraphs(self, content):
         """產出書本 txt「會被輸出端查找」的精確段落字串——
@@ -5049,7 +5099,7 @@ class ModTranslatorApp:
         強制重翻時不刪 shelve 快取，而是把分析出的字串列為本輪忽略。
         只有本輪新翻譯成功並加入 _session_translated_keys 後，才視為可用。
         """
-        if not isinstance(text, str) or text not in self.translation_cache:
+        if not isinstance(text, str):
             return False
         # force 模式下仍允許快取 fallback：翻譯引擎未翻到的字串，
         # 輸出時會從快取取回，避免產生未翻譯的輸出
@@ -5677,6 +5727,16 @@ class ModTranslatorApp:
                 "尚未分析或未找到任何可翻譯檔案！\n請先點「🔍 分析檔案」。")
             return
 
+        current_class_choice = bool(self.class_tooltip_patch_var.get())
+        analyzed_class_choice = getattr(
+            self, '_scan_class_tooltip_patch', current_class_choice)
+        if current_class_choice != analyzed_class_choice:
+            messagebox.showerror(
+                "需要重新分析",
+                "低風險 class/JAR 修補選項已變更。\n"
+                "請重新按一次「分析檔案」，避免使用舊掃描結果。")
+            return
+
         pack_format = self.pack_format_var.get()
         if not (1 <= pack_format <= 99):
             messagebox.showerror("錯誤", "pack_format 必須介於 1 ~ 99 之間！")
@@ -5754,14 +5814,28 @@ class ModTranslatorApp:
     def _enable_pack_in_options(self, options_path, pack_id):
         if not os.path.exists(options_path):
             return False
+        temp_fd = None
+        temp_path = None
         try:
-            with open(options_path, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.read().splitlines()
+            import tempfile
+
+            with open(options_path, "rb") as f:
+                original_data = f.read()
+            original_text = original_data.decode("utf-8", errors="surrogateescape")
+            lines = original_text.splitlines(keepends=True)
             out = []
             saw_packs = False
             saw_lang = False
-            changed = False
-            for line in lines:
+            preferred_newline = next(
+                (ending for line in lines
+                 for ending in ("\r\n", "\n", "\r")
+                 if line.endswith(ending)),
+                os.linesep)
+            for original_line in lines:
+                ending = next(
+                    (value for value in ("\r\n", "\n", "\r")
+                     if original_line.endswith(value)), "")
+                line = original_line[:-len(ending)] if ending else original_line
                 if line.startswith("resourcePacks:"):
                     saw_packs = True
                     packs = self._parse_options_pack_list(line[len("resourcePacks:"):])
@@ -5774,27 +5848,80 @@ class ModTranslatorApp:
                         packs = [p for p in packs if p != pack_id]
                     packs.append(pack_id)
                     new_line = "resourcePacks:" + json.dumps(packs, ensure_ascii=False, separators=(",", ":"))
-                    changed = changed or new_line != line
-                    out.append(new_line)
+                    out.append(new_line + ending)
                 elif line.startswith("lang:"):
                     saw_lang = True
                     new_line = "lang:zh_tw"
-                    changed = changed or new_line != line
-                    out.append(new_line)
+                    out.append(new_line + ending)
                 else:
-                    out.append(line)
+                    out.append(original_line)
+
+            additions = []
             if not saw_packs:
-                out.append("resourcePacks:" + json.dumps(["vanilla", "mod_resources", pack_id], ensure_ascii=False, separators=(",", ":")))
-                changed = True
+                additions.append(
+                    "resourcePacks:" + json.dumps(
+                        ["vanilla", "mod_resources", pack_id],
+                        ensure_ascii=False, separators=(",", ":")))
             if not saw_lang:
-                out.append("lang:zh_tw")
-                changed = True
-            if changed:
-                with open(options_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(out) + "\n")
-            return changed
+                additions.append("lang:zh_tw")
+
+            new_text = "".join(out)
+            if additions:
+                had_final_newline = original_text.endswith(("\r\n", "\n", "\r"))
+                if new_text and not new_text.endswith(("\r\n", "\n", "\r")):
+                    new_text += preferred_newline
+                new_text += preferred_newline.join(additions)
+                if had_final_newline:
+                    new_text += preferred_newline
+
+            new_data = new_text.encode("utf-8", errors="surrogateescape")
+            if new_data == original_data:
+                return False
+
+            backup_path = options_path + ".translator.bak"
+            backup_created = False
+            try:
+                with open(backup_path, "xb") as backup_file:
+                    backup_created = True
+                    backup_file.write(original_data)
+                    backup_file.flush()
+                    os.fsync(backup_file.fileno())
+            except FileExistsError:
+                pass
+            except OSError:
+                if backup_created:
+                    try:
+                        os.remove(backup_path)
+                    except OSError:
+                        pass
+                return False
+
+            options_dir = os.path.dirname(os.path.abspath(options_path))
+            temp_fd, temp_path = tempfile.mkstemp(
+                prefix=f".{os.path.basename(options_path)}.translator.",
+                suffix=".tmp", dir=options_dir)
+            temp_file = os.fdopen(temp_fd, "wb")
+            temp_fd = None
+            with temp_file:
+                temp_file.write(new_data)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+            os.replace(temp_path, options_path)
+            temp_path = None
+            return True
         except OSError:
             return False
+        finally:
+            if temp_fd is not None:
+                try:
+                    os.close(temp_fd)
+                except OSError:
+                    pass
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
     @staticmethod
     def _parse_options_pack_list(raw):
@@ -5811,8 +5938,8 @@ class ModTranslatorApp:
     # ═══════════════════════════════════════════════
     def _ask_proceed_from_thread(self, title, msg):
         """從工作執行緒安全地在主執行緒彈出 Yes/No 確認框，回傳使用者選擇。
-        若 5 分鐘內無回應則預設繼續（True）。"""
-        result = [True]
+        若 5 分鐘內無回應則預設拒絕（False）。"""
+        result = [False]
         event  = threading.Event()
         def _show():
             result[0] = messagebox.askyesno(title, msg, parent=self.root)
@@ -5831,7 +5958,7 @@ class ModTranslatorApp:
         return core_write_failed_items_report(self, untranslated, fmt_issues, context)
 
     # ═══════════════════════════════════════════════
-    #  JAR 直接套用模式：注入語言包至 JAR，打包成模組語言包
+    #  安全覆蓋模式：Paxi/OpenLoader 與設定檔，不重建客戶端模組 JAR
     # ═══════════════════════════════════════════════
     @staticmethod
     def _mixin_targets_client_renderer(text):

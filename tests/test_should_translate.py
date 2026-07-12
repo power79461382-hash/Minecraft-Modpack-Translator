@@ -88,6 +88,32 @@ class ShouldTranslateTests(unittest.TestCase):
     def test_pure_format_code(self):
         self.assertFalse(self.app.should_translate("§d§l§9"))
 
+    def test_patchouli_template_control_tokens(self):
+        for token in (
+                "#recipe", "#heading", "#text", "#image", "#item",
+                "#link", "#anchor", "#tier#", "#mana_cost#", "#school#",
+                "#output", "#reagent", "#footer", "#page_title"):
+            self.assertFalse(
+                self.app.should_translate(token),
+                f"Patchouli control token must remain structural: {token}")
+
+    def test_patchouli_control_token_ignores_broken_cached_translation(self):
+        self.app.stop_requested = False
+        self.app.translation_cache = {
+            "#recipe": "#食譜",
+            "#mana_cost#": "#法力消耗#",
+        }
+
+        output = self.app.process_json_data({
+            "recipe_name": "#recipe",
+            "text": "#mana_cost#",
+        })
+
+        self.assertEqual(output, {
+            "recipe_name": "#recipe",
+            "text": "#mana_cost#",
+        })
+
 
 if __name__ == "__main__":
     unittest.main()

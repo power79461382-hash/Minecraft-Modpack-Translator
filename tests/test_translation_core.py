@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import re
@@ -175,6 +176,51 @@ class TranslationCacheTests(unittest.TestCase):
                 self.assertNotIn("Hello", reopened)
             finally:
                 reopened.close()
+
+    def test_sqlite_snapshot_merges_persisted_and_pending_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "translation_cache.json")
+            cache, _messages = load_translation_cache(
+                path, FORMAT_RE, lambda _s, t: bool(t))
+            try:
+                cache.bulk_update([
+                    ("Persisted", "舊值"),
+                    ("Stored", "資料庫"),
+                ])
+                cache["Persisted"] = "新值"
+                cache["Pending"] = "待寫入"
+
+                snapshot = cache.snapshot(
+                    {"Persisted", "Stored", "Pending", "Missing"})
+
+                self.assertEqual(snapshot, {
+                    "Persisted": "新值",
+                    "Stored": "資料庫",
+                    "Pending": "待寫入",
+                })
+            finally:
+                cache.close()
+
+    def test_sqlite_snapshot_preserves_original_keys_after_sanitized_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "translation_cache.json")
+            cache, _messages = load_translation_cache(
+                path, FORMAT_RE, lambda _s, t: bool(t))
+            try:
+                canonical = "BrokenKey"
+                malformed = "Broken\ud800Key"
+                cache[canonical] = "資料庫值"
+                cache.sync()
+                cache[canonical] = "待寫入值"
+
+                snapshot = cache.snapshot({canonical, malformed})
+
+                self.assertEqual(snapshot, {
+                    canonical: "待寫入值",
+                    malformed: "待寫入值",
+                })
+            finally:
+                cache.close()
 
     def test_pause_checkpoint_uses_light_save_only(self):
         class App:
@@ -506,27 +552,20 @@ class PatchouliJsonTranslationTests(unittest.TestCase):
         self.assertNotIn("patchouli:text", missing)
         self.assertNotIn("example:gem", missing)
 
-    def test_structured_book_json_retries_untranslated_visible_fields_before_output(self):
+    def test_structured_book_json_packaging_never_calls_translation_network(self):
         app = object.__new__(ModTranslatorApp)
         app.stop_requested = False
         app._to_traditional = lambda value: value
-        app.log = lambda *_args, **_kwargs: None
+        logs = []
+        app.log = logs.append
         translations = {}
-        final_translations = {
-            "Gem Socketing": "寶石鑲嵌",
-            "Unwanted Unique weapons can be smelted down.": "不需要的獨特武器可以熔化。",
-        }
 
         def get_translation(text):
             return translations.get(text, text)
 
-        def batch_translate_missing(strings, _force_chunk_size=None, _preferred_engine=None):
-            for text in strings:
-                if text in final_translations:
-                    translations[text] = final_translations[text]
-
         app.get_translation = get_translation
-        app.batch_translate_missing = batch_translate_missing
+        app.batch_translate_missing = lambda *_args, **_kwargs: self.fail(
+            "packaging must not make translation network requests")
 
         source = {
             "name": "Gem Socketing",
@@ -554,11 +593,19 @@ class PatchouliJsonTranslationTests(unittest.TestCase):
         repaired = app._repair_structured_book_json_output(
             source, {}, merged, process_book_data, "test")
 
-        self.assertEqual(repaired["name"], "寶石鑲嵌")
-        self.assertEqual(repaired["pages"][0]["text"], "不需要的獨特武器可以熔化。")
+        self.assertIs(repaired, merged)
+        self.assertEqual(repaired["name"], "Gem Socketing")
+        self.assertEqual(
+            repaired["pages"][0]["text"],
+            "Unwanted Unique weapons can be smelted down.")
         self.assertEqual(repaired["category"], "apotheosis:adventure/root")
         self.assertEqual(repaired["pages"][0]["type"], "patchouli:text")
         self.assertEqual(repaired["pages"][0]["item"], "example:gem")
+        self.assertTrue(any(
+            "test" in message
+            and "2" in message
+            and "打包階段不發送網路翻譯" in message
+            for message in logs))
 
 
 class StructuralReferenceGuardTests(unittest.TestCase):
@@ -865,9 +912,9 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
         self.assertEqual(engine_rate_limit_cooldown("non_ai_chain", "bing", 10), 60.0)
         self.assertEqual(engine_rate_limit_cooldown("azure", "azure", 10), 10.0)
 
-    def test_translation_worker_limit_keeps_bing_fast(self):
-        self.assertEqual(translation_worker_limit(16, "bing", "non_ai_chain"), 16)
-        self.assertEqual(translation_worker_limit(32, "bing", "non_ai_chain"), 24)
+    def test_translation_worker_limit_caps_bing_large_batch_burst(self):
+        self.assertEqual(translation_worker_limit(16, "bing", "non_ai_chain"), 4)
+        self.assertEqual(translation_worker_limit(32, "bing", "non_ai_chain"), 4)
         self.assertEqual(translation_worker_limit(16, "gtx", "non_ai_chain"), 8)
         self.assertEqual(translation_worker_limit(16, "mymemory", "non_ai_chain"), 4)
         self.assertEqual(translation_worker_limit(16, "deepseek", "market_ai"), 8)
@@ -940,7 +987,7 @@ class JarPatcherTests(unittest.TestCase):
             self.assertIn("renderer-mixin", reasons)
             self.assertTrue(jar_rewrite_is_high_risk(reasons))
 
-    def test_high_risk_jar_allows_assets_language_only_patch(self):
+    def test_high_risk_jar_without_safe_loader_is_not_rewritten(self):
         class Var:
             def __init__(self, value):
                 self.value = value
@@ -1062,42 +1109,13 @@ class JarPatcherTests(unittest.TestCase):
             app = FakeApp(jar_path)
             output_path = generate_jar_patches(app, tmp, "中文.zip", mc_dir)
 
-            self.assertTrue(os.path.exists(output_path))
-            with zipfile.ZipFile(output_path) as pack:
-                self.assertIn("mods/origins-classes-forge.jar", pack.namelist())
-                with pack.open("mods/origins-classes-forge.jar") as patched_jar_file:
-                    patched_bytes = patched_jar_file.read()
-            patched_path = os.path.join(tmp, "patched.jar")
-            with open(patched_path, "wb") as f:
-                f.write(patched_bytes)
-            with zipfile.ZipFile(patched_path) as patched_jar:
-                self.assertIn(
-                    "assets/origins-classes/lang/zh_tw.json",
-                    patched_jar.namelist())
-                self.assertIn(
-                    "assets/immersiveengineering/manual/zh_tw/accumulators.txt",
-                    patched_jar.namelist())
-                self.assertIn(
-                    "assets/immersiveengineering/manual/en_us/accumulators.txt",
-                    patched_jar.namelist())
-                self.assertIn(
-                    "assets/alexsmobs/book/animal_dictionary/zh_tw/capuchin_monkey.txt",
-                    patched_jar.namelist())
-                self.assertIn(
-                    "assets/alexsmobs/book/animal_dictionary/en_us/capuchin_monkey.txt",
-                    patched_jar.namelist())
-                data = json.loads(patched_jar.read(
-                    "assets/origins-classes/lang/zh_tw.json").decode("utf-8"))
-                manual_text = patched_jar.read(
-                    "assets/immersiveengineering/manual/zh_tw/accumulators.txt"
-                ).decode("utf-8")
-                repaired_book = patched_jar.read(
-                    "assets/alexsmobs/book/animal_dictionary/en_us/capuchin_monkey.txt"
-                ).decode("utf-8")
-            self.assertEqual(data["origin.origins-classes.warrior.name"], "戰士")
-            self.assertEqual(manual_text, "蓄電器文字")
-            self.assertEqual(repaired_book, "捲尾猴文字")
-            self.assertTrue(any("只注入語言/手冊/Patchouli/成就文字資源" in line for line in app.logs))
+            self.assertEqual(output_path, "")
+            self.assertFalse(os.path.exists(
+                os.path.join(tmp, "中文_模組語言包.zip")))
+            self.assertTrue(any(
+                "origins-classes-forge.jar" in line
+                and "禁止重包模組 JAR" in line
+                for line in app.logs))
 
     def test_empty_translated_language_is_not_packaged(self):
         class Var:
@@ -1345,7 +1363,7 @@ class JarPatcherTests(unittest.TestCase):
             self.assertTrue(any("resourcepacks/shared.jar" in line for line in app.logs))
             self.assertTrue(any("resourcepacks/shared.zip" in line for line in app.logs))
 
-    def test_high_risk_patchouli_with_paxi_rebuilds_safe_text_json(self):
+    def test_high_risk_patchouli_with_paxi_uses_safe_overlays(self):
         class Var:
             def __init__(self, value):
                 self.value = value
@@ -1472,24 +1490,25 @@ class JarPatcherTests(unittest.TestCase):
             self.assertTrue(os.path.exists(output_path))
             with zipfile.ZipFile(output_path) as pack:
                 names = set(pack.namelist())
-                self.assertIn("mods/simplyswords.jar", names)
-                self.assertNotIn("config/paxi/datapack_load_order.json", names)
-                self.assertNotIn("config/paxi/resourcepack_load_order.json", names)
-                patched_bytes = pack.read("mods/simplyswords.jar")
-            patched_path = os.path.join(tmp, "patched-simplyswords.jar")
-            with open(patched_path, "wb") as f:
-                f.write(patched_bytes)
-            with zipfile.ZipFile(patched_path) as patched_jar:
+                self.assertNotIn("mods/simplyswords.jar", names)
+                self.assertIn("config/paxi/datapack_load_order.json", names)
+                self.assertIn("config/paxi/resourcepack_load_order.json", names)
+                datapack_name = next(
+                    name for name in names
+                    if name.startswith("config/paxi/datapacks/")
+                    and name.endswith(".zip"))
+                datapack_bytes = pack.read(datapack_name)
+            with zipfile.ZipFile(io.BytesIO(datapack_bytes)) as datapack:
                 patchouli_path = (
                     "data/simplyswords/patchouli_books/runic_grimoire/en_us/"
                     "categories/category_gem_socketing.json")
-                self.assertIn(patchouli_path, patched_jar.namelist())
-                data = json.loads(patched_jar.read(patchouli_path).decode("utf-8"))
+                self.assertIn(patchouli_path, datapack.namelist())
+                data = json.loads(datapack.read(patchouli_path).decode("utf-8"))
             self.assertEqual(data["name"], "寶石鑲嵌")
             self.assertEqual(data["description"], "不需要的獨特武器可以熔化。")
-            self.assertTrue(any("Patchouli/成就文字資源" in line for line in app.logs))
+            self.assertTrue(any("原始模組 JAR 不修改" in line for line in app.logs))
 
-    def test_high_risk_patchouli_without_paxi_rebuilds_safe_text_json(self):
+    def test_high_risk_patchouli_without_paxi_is_not_rewritten(self):
         class Var:
             def __init__(self, value):
                 self.value = value
@@ -1610,20 +1629,13 @@ class JarPatcherTests(unittest.TestCase):
             app = FakeApp(jar_path)
             output_path = generate_jar_patches(app, tmp, "客戶端.zip", mc_dir)
 
-            with zipfile.ZipFile(output_path) as pack:
-                self.assertIn("mods/irons_spellbooks.jar", pack.namelist())
-                patched_bytes = pack.read("mods/irons_spellbooks.jar")
-                self.assertNotIn("config/paxi/datapack_load_order.json", pack.namelist())
-            patched_path = os.path.join(tmp, "patched.jar")
-            with open(patched_path, "wb") as f:
-                f.write(patched_bytes)
-            with zipfile.ZipFile(patched_path) as patched_jar:
-                book_path = "data/irons_spellbooks/patchouli_books/iss_guide_book/book.json"
-                self.assertIn(book_path, patched_jar.namelist())
-                book = json.loads(patched_jar.read(book_path).decode("utf-8"))
-            self.assertEqual(book["name"], "鐵人指南")
-            self.assertIn("角色扮演", book["landing_text"])
-            self.assertTrue(any("Patchouli/成就文字資源" in line for line in app.logs))
+            self.assertEqual(output_path, "")
+            self.assertFalse(os.path.exists(
+                os.path.join(tmp, "客戶端_模組語言包.zip")))
+            self.assertTrue(any(
+                "irons_spellbooks.jar" in line
+                and "禁止重包模組 JAR" in line
+                for line in app.logs))
 
 
 class GuiDelegateTests(unittest.TestCase):

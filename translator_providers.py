@@ -1,8 +1,12 @@
 import html
 import json
+import math
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
@@ -43,9 +47,41 @@ GTX_MINECRAFT_GLOSSARY = {
 # below the documented ceiling, but avoid the old 50-item split that doubled
 # request count for the app's 100-item chunks.
 BING_BATCH_SIZE = 320
+AZURE_BATCH_SIZE = 100
+AZURE_BATCH_CHARS = 45_000
 GTX_GATE_INTERVAL = 0.08
 GTX_BATCH_SIZE = 80
 GTX_BATCH_CHARS = 5000
+GTX_SINGLETON_WORKERS = 8
+
+
+def parse_retry_after_seconds(value, default=10.0, now=None):
+    """Parse Retry-After seconds or an HTTP date without leaking errors."""
+    try:
+        fallback = float(default)
+    except (TypeError, ValueError):
+        fallback = 10.0
+    if not math.isfinite(fallback) or fallback <= 0:
+        fallback = 10.0
+
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        seconds = None
+    if seconds is not None and math.isfinite(seconds):
+        return max(1.0, seconds)
+
+    try:
+        retry_at = parsedate_to_datetime(str(value).strip())
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        current = time.time() if now is None else float(now)
+        seconds = retry_at.timestamp() - current
+        if math.isfinite(seconds):
+            return max(1.0, seconds)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return fallback
 
 
 def parse_gtx_numbered_batch(text, expected_count):
@@ -338,6 +374,9 @@ def build_provider_registry(session, settings):
     gtx_lock = threading.Lock()
     gtx_last_req = [0.0]
     gtx_interval = GTX_GATE_INTERVAL
+    gtx_worker_count = max(1, int(GTX_SINGLETON_WORKERS or 1))
+    gtx_request_gate = threading.BoundedSemaphore(gtx_worker_count)
+    gtx_singleton_executor = ThreadPoolExecutor(max_workers=gtx_worker_count)
 
     def gtx_gate():
         # 鎖內只「預約」下一個發射時間槽，sleep 移到鎖外，
@@ -365,11 +404,12 @@ def build_provider_registry(session, settings):
             yield batch
 
     def _gtx_request(params_fn, text, timeout):
-        gtx_gate()
-        return http_session().get(
-            "https://translate.googleapis.com/translate_a/single",
-            params=params_fn(text),
-            timeout=timeout)
+        with gtx_request_gate:
+            gtx_gate()
+            return http_session().get(
+                "https://translate.googleapis.com/translate_a/single",
+                params=params_fn(text),
+                timeout=timeout)
 
     def _gtx_batch_translate(batch, params_fn, depth=0):
         if should_stop():
@@ -390,6 +430,8 @@ def build_provider_registry(session, settings):
                     if parts:
                         return [apply_gtx_glossary(src, dst)
                                 for src, dst in zip(batch, parts)], None
+                elif res.status_code not in (413, 414):
+                    return None, f"ERR:GTX HTTP {res.status_code}"
             if len(batch) > 1 and depth < 4:
                 mid = max(1, len(batch) // 2)
                 left, err = _gtx_batch_translate(batch[:mid], params_fn, depth + 1)
@@ -401,10 +443,13 @@ def build_provider_registry(session, settings):
                 return left + right, None
 
             if len(batch) > 1:
+                outcomes = list(gtx_singleton_executor.map(
+                    lambda item: _gtx_batch_translate(
+                        [item], params_fn, depth + 1),
+                    batch,
+                ))
                 results = []
-                for item in batch:
-                    item_result, err = _gtx_batch_translate(
-                        [item], params_fn, depth + 1)
+                for item_result, err in outcomes:
                     if err:
                         return None, err
                     results.append(item_result[0] if item_result else None)
@@ -417,10 +462,9 @@ def build_provider_registry(session, settings):
                 text = html.unescape("".join(p[0] for p in res.json()[0] if p[0]))
                 translated = text.strip() or None
                 return [apply_gtx_glossary(batch[0], translated)], None
-            if res.status_code in (403, 503):
-                return None, "429:60"
-        except requests.RequestException:
-            return None, "429:20"
+            return None, f"ERR:GTX HTTP {res.status_code}"
+        except requests.RequestException as e:
+            return None, f"ERR:GTX 連線失敗: {e}"
         except (ValueError, TypeError, KeyError, IndexError):
             pass
         return [None] * len(batch), None
@@ -485,27 +529,63 @@ def build_provider_registry(session, settings):
             return None, f"ERR:DeepL 連線失敗: {e}"
 
     def azure(chunk_data):
-        try:
-            res = http_session().post(
-                azure_url,
-                headers={"Ocp-Apim-Subscription-Key": azure_key,
-                         "Ocp-Apim-Subscription-Region": azure_region,
-                         "Content-Type": "application/json"},
-                params={"api-version": "3.0", "from": "en", "to": "zh-Hant"},
-                json=[{"text": t} for t in chunk_data],
-                timeout=(3, 12))
-            if res.status_code == 200:
-                return [i['translations'][0]['text'] for i in res.json()], None
-            if res.status_code == 429:
-                cd = float(res.headers.get("Retry-After", 10))
-                return None, f"429:{cd}"
-            if res.status_code == 401:
-                return None, "DISABLED:Azure 驗證失敗，請確認 Key 與 Region"
-            if res.status_code == 403:
-                return None, "DISABLED:Azure 無授權（Key 無效或地區不符）"
-            return None, f"ERR:Azure HTTP {res.status_code}"
-        except requests.RequestException as e:
-            return None, f"ERR:Azure 連線失敗: {e}"
+        results = []
+        batch = []
+        batch_chars = 0
+        batches = []
+        for text in chunk_data:
+            text_chars = len(text)
+            if text_chars > AZURE_BATCH_CHARS:
+                return None, (
+                    f"ERR:Azure 單筆文字超過 {AZURE_BATCH_CHARS:,} 字元")
+            if batch and (len(batch) >= AZURE_BATCH_SIZE
+                          or batch_chars + text_chars > AZURE_BATCH_CHARS):
+                batches.append(batch)
+                batch = []
+                batch_chars = 0
+            batch.append(text)
+            batch_chars += text_chars
+        if batch:
+            batches.append(batch)
+
+        for batch in batches:
+            try:
+                res = http_session().post(
+                    azure_url,
+                    headers={"Ocp-Apim-Subscription-Key": azure_key,
+                             "Ocp-Apim-Subscription-Region": azure_region,
+                             "Content-Type": "application/json"},
+                    params={"api-version": "3.0", "from": "en", "to": "zh-Hant"},
+                    json=[{"text": t} for t in batch],
+                    timeout=(3, 12))
+                if res.status_code == 200:
+                    try:
+                        translated = [
+                            item['translations'][0]['text']
+                            for item in res.json()
+                        ]
+                    except (ValueError, TypeError, KeyError, IndexError) as e:
+                        return None, (
+                            "ERR:Azure incomplete translation response: "
+                            f"{e}")
+                    if len(translated) != len(batch):
+                        return None, (
+                            "ERR:Azure incomplete translation response: "
+                            f"expected {len(batch)}, got {len(translated)}")
+                    results.extend(translated)
+                    continue
+                if res.status_code == 429:
+                    cd = parse_retry_after_seconds(
+                        res.headers.get("Retry-After"), default=10.0)
+                    return None, f"429:{cd}"
+                if res.status_code == 401:
+                    return None, "DISABLED:Azure 驗證失敗，請確認 Key 與 Region"
+                if res.status_code == 403:
+                    return None, "DISABLED:Azure 無授權（Key 無效或地區不符）"
+                return None, f"ERR:Azure HTTP {res.status_code}"
+            except requests.RequestException as e:
+                return None, f"ERR:Azure 連線失敗: {e}"
+        return results, None
 
     def claude(chunk_data):
         return ai_chunk(
@@ -623,7 +703,13 @@ def build_provider_registry(session, settings):
     # 再呼叫微軟官方 Translator v3 API：陣列批次、回應逐條對齊，
     # 原生支援 zh-Hant。與 plainheart/bing-translate-api 等開源專案同做法。
     bing_lock = threading.Lock()
-    bing_state = {"token": "", "expiry": 0.0, "auth_fails": 0}
+    bing_token_refresh_lock = threading.Lock()
+    bing_state = {
+        "token": "",
+        "expiry": 0.0,
+        "auth_fails": 0,
+        "disabled": False,
+    }
     bing_gate_state = [0.0]
     BING_GATE_INTERVAL = 0.005
 
@@ -640,15 +726,23 @@ def build_provider_registry(session, settings):
         with bing_lock:
             if bing_state["token"] and time.time() < bing_state["expiry"]:
                 return bing_state["token"]
-        res = http_session().get("https://edge.microsoft.com/translate/auth",
-                                 timeout=(2, 6))
-        if res.status_code != 200 or not res.text.strip():
-            raise RuntimeError(f"auth HTTP {res.status_code}")
-        token = res.text.strip()
-        with bing_lock:
-            bing_state["token"] = token
-            bing_state["expiry"] = time.time() + 8 * 60   # JWT 約 10 分鐘，提早刷新
-        return token
+        # Only one worker refreshes the shared token. Re-check after acquiring
+        # because another worker may already have completed the refresh.
+        with bing_token_refresh_lock:
+            with bing_lock:
+                if (bing_state["token"]
+                        and time.time() < bing_state["expiry"]):
+                    return bing_state["token"]
+            res = http_session().get(
+                "https://edge.microsoft.com/translate/auth", timeout=(2, 6))
+            if res.status_code != 200 or not res.text.strip():
+                raise RuntimeError(f"auth HTTP {res.status_code}")
+            token = res.text.strip()
+            with bing_lock:
+                bing_state["token"] = token
+                # JWT 約 10 分鐘，提早刷新。
+                bing_state["expiry"] = time.time() + 8 * 60
+            return token
 
     def bing(chunk_data):
         results = []
@@ -658,30 +752,52 @@ def build_provider_registry(session, settings):
                 results.extend([None] * (len(chunk_data) - len(results)))
                 break
             batch = chunk_data[i:i + batch_size]
-            _bing_gate()
-            try:
-                token = _bing_token()
-            except (requests.RequestException, RuntimeError) as e:
-                return None, f"ERR:Bing token 取得失敗: {e}"
-            try:
-                res = http_session().post(
-                    "https://api.cognitive.microsofttranslator.com/translate",
-                    params={"api-version": "3.0", "to": "zh-Hant"},
-                    headers={"Authorization": f"Bearer {token}",
-                             "Content-Type": "application/json"},
-                    json=[{"Text": t} for t in batch],
-                    timeout=(2, 6))
-            except requests.RequestException as e:
-                return None, f"ERR:Bing 連線失敗: {e}"
-            if res.status_code in (401, 403):
+            auth_retries = 0
+            while True:
                 with bing_lock:
-                    bing_state["expiry"] = 0.0   # token 失效 → 下次重取
-                    bing_state["auth_fails"] += 1
+                    if bing_state["disabled"]:
+                        return None, (
+                            "DISABLED:Bing 端點連續拒絕授權（401/403），本場停用")
+                _bing_gate()
+                try:
+                    token = _bing_token()
+                except (requests.RequestException, RuntimeError) as e:
+                    action = "刷新" if auth_retries else "取得"
+                    return None, f"ERR:Bing token {action}失敗: {e}"
+                try:
+                    res = http_session().post(
+                        "https://api-edge.cognitive.microsofttranslator.com/translate",
+                        params={"api-version": "3.0", "to": "zh-Hant"},
+                        headers={"Authorization": f"Bearer {token}",
+                                 "Content-Type": "application/json"},
+                        json=[{"Text": t} for t in batch],
+                        timeout=(2, 6))
+                except requests.RequestException as e:
+                    return None, f"ERR:Bing 連線失敗: {e}"
+                if res.status_code not in (401, 403):
+                    break
+
+                with bing_lock:
+                    # A delayed rejection for an older token must not clear the
+                    # fresh token another worker already installed.
+                    rejected_current = bing_state["token"] == token
+                    if rejected_current:
+                        bing_state["token"] = ""
+                        bing_state["expiry"] = 0.0
+                        bing_state["auth_fails"] += 1
                     fails = bing_state["auth_fails"]
-                if fails >= 3:
-                    # 端點持續拒收（IP 風控/政策變更）→ 停用而非每 5 秒重撞
+                    if rejected_current and fails >= 2:
+                        bing_state["disabled"] = True
+                    disabled = bing_state["disabled"]
+                if disabled:
                     return None, "DISABLED:Bing 端點連續拒絕授權（401/403），本場停用"
-                return None, "429:5"
+                if rejected_current:
+                    auth_retries += 1
+                if auth_retries >= 2:
+                    with bing_lock:
+                        bing_state["disabled"] = True
+                    return None, (
+                        "DISABLED:Bing 端點連續拒絕授權（401/403），本場停用")
             if res.status_code == 429:
                 return None, "429:60"
             if res.status_code != 200:

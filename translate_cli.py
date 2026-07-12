@@ -54,6 +54,9 @@ def parse_args():
     parser.add_argument("--skip-quests", action="store_true", help="Skip quest/config outputs")
     parser.add_argument("--max-steps", type=int, default=-1, help="Limit analyzed file targets")
     parser.add_argument("--retry", type=int, default=None, help="Validation retry count")
+    parser.add_argument(
+        "--server-mode", action="store_true",
+        help="Explicitly allow dedicated-server JAR output (requires server.properties)")
     parser.add_argument("--engine", choices=(
         "market_ai", "non_ai_chain", "google", "deepl", "azure",
         "claude", "openai", "local"))
@@ -136,6 +139,7 @@ def main():
     root = tk.Tk()
     root.withdraw()
     app = CliModTranslatorApp(root)
+    app._server_mode_requested = bool(getattr(args, "server_mode", False))
     app.mod_dir_var.set(modpack)
     app.rp_dir_var.set(output_dir)
     app.rp_name_var.set(output_name)

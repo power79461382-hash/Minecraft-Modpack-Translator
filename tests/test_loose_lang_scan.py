@@ -21,6 +21,7 @@ class Root:
 
 class ScanApp:
     _LANG_FALLBACK_ORDER = ["en_us.json", "zh_cn.json"]
+    _version_detection_required = False
 
     def __init__(self, mode):
         self.process_mode_var = Value(mode)

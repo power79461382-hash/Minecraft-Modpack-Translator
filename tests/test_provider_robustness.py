@@ -1,6 +1,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 import translator_providers as providers
 
 
@@ -144,3 +146,26 @@ def test_gtx_depth_cap_propagates_single_item_rate_limit(monkeypatch):
     assert result == [None] * len(sources)
     assert error == "429:30"
     assert fake_session.singleton_queries == sources
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FakeGTXResponse(status_code=403),
+        FakeGTXResponse(status_code=503),
+        providers.requests.ConnectionError("temporary network failure"),
+    ],
+)
+def test_gtx_only_real_http_429_uses_rate_limit_error(monkeypatch, failure):
+    def singleton_response(_query):
+        if isinstance(failure, BaseException):
+            raise failure
+        return failure
+
+    gtx, _fake_session = make_gtx(monkeypatch, singleton_response)
+
+    result, error = gtx(["source"])
+
+    assert result == [None]
+    assert error is not None
+    assert not error.startswith("429:")
