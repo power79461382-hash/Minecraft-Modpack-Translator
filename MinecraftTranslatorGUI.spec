@@ -1,15 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_all
+
+opencc_datas, opencc_binaries, opencc_hiddenimports = collect_all('opencc')
 
 a = Analysis(
     ['MinecraftTranslatorGUI.py'],
     pathex=[],
-    binaries=[],
+    binaries=opencc_binaries,
     datas=[
         ('app_icon.png', '.'),
         ('app_icon.ico', '.'),
-    ],
-    hiddenimports=[],
+    ] + opencc_datas,
+    hiddenimports=list(opencc_hiddenimports) + ['opencc'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
