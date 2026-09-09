@@ -468,8 +468,22 @@ def convert_existing_zh_base(value, to_traditional):
     return value
 
 
+def _source_has_cjk(text: str) -> bool:
+    """True if text contains CJK ideographs (shared or locale-specific)."""
+    return any(
+        ('一' <= ch <= '鿿') or ('㐀' <= ch <= '䶿')
+        for ch in text
+    )
+
+
 def drop_untranslated_lang_entries(source_data, output_data):
-    """Remove flat language entries that still equal their source text."""
+    """Remove flat language entries that still equal their source text.
+
+    Exception: when the source is already Chinese, keep the entry even if the
+    value is unchanged. Simplified→Traditional conversion is often a no-op for
+    shared glyphs (e.g. 木), and dropping those keys empties zh_tw packs for
+    zh_cn-only mods.
+    """
     if not isinstance(source_data, dict) or not isinstance(output_data, dict):
         return output_data, 0
 
@@ -478,7 +492,13 @@ def drop_untranslated_lang_entries(source_data, output_data):
     for key, value in output_data.items():
         source_value = source_data.get(key)
         if isinstance(source_value, str) and isinstance(value, str):
-            if not value.strip() or value == source_value:
+            if not value.strip():
+                dropped += 1
+                continue
+            if value == source_value:
+                if _source_has_cjk(source_value):
+                    cleaned[key] = value
+                    continue
                 dropped += 1
                 continue
         cleaned[key] = value

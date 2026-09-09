@@ -555,7 +555,7 @@ def build_provider_registry(session, settings):
                     headers={"Ocp-Apim-Subscription-Key": azure_key,
                              "Ocp-Apim-Subscription-Region": azure_region,
                              "Content-Type": "application/json"},
-                    params={"api-version": "3.0", "from": "en", "to": "zh-Hant"},
+                    params={"api-version": "3.0", "to": "zh-Hant"},  # omit from= for auto-detect (zh_cn sources)
                     json=[{"text": t} for t in batch],
                     timeout=(3, 12))
                 if res.status_code == 200:
@@ -675,9 +675,15 @@ def build_provider_registry(session, settings):
                 results.extend([None] * (len(chunk_data) - len(results)))
                 break
             try:
+                # Prefer zh-CN→zh-TW when source already has CJK; else en→zh-TW.
+                langpair = (
+                    "zh-CN|zh-TW"
+                    if any("一" <= ch <= "鿿" for ch in text)
+                    else "en|zh-TW"
+                )
                 res = http_session().get(
                     "https://api.mymemory.translated.net/get",
-                    params={"q": text, "langpair": "en|zh-TW"},
+                    params={"q": text, "langpair": langpair},
                     timeout=(5, 20))
                 if res.status_code == 429:
                     results.extend([None] * (len(chunk_data) - len(results)))

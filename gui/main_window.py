@@ -3864,6 +3864,7 @@ class ModTranslatorApp:
         '气库将应尔马鸟龙灵纠'
         '质无软练钮语墙华业声'
         '车门风联买卖历难观龄'
+        '装备防护击灭验证损伤'
         ,
         # 繁體（目標）
         '們國時這來說對進現過'
@@ -3881,12 +3882,21 @@ class ModTranslatorApp:
         '氣庫將應爾馬鳥龍靈糾'
         '質無軟練鈕語牆華業聲'
         '車門風聯買賣歷難觀齡'
+        '裝備防護擊滅驗證損傷'
     )
 
     _SIMP_TO_TRAD_PHRASES = (
         ('圣骑士', '聖騎士'),
         ('圣骑', '聖騎'),
         ('干枯', '乾枯'),
+        ('装备', '裝備'),
+        ('防御', '防禦'),
+        ('伤害', '傷害'),
+        ('护甲', '護甲'),
+        ('攻击', '攻擊'),
+        ('灭火', '滅火'),
+        ('验证', '驗證'),
+        ('损伤', '損傷'),
     )
 
     @staticmethod
@@ -5458,6 +5468,9 @@ class ModTranslatorApp:
                     # 整句送翻會弄壞 JSON 結構 → 改用元件級翻譯（只動 text 欄位）
                     component = self._translate_json_text_component_string(v)
                     new_data[k] = component if component is not None else self.get_translation(v)
+                elif isinstance(v, str) and self._has_cjk_text(v):
+                    # 已是中文（常見於僅有 zh_cn 的模組）：簡→繁，勿原樣留下再被 drop
+                    new_data[k] = self._to_traditional(v)
                 elif isinstance(v, (dict, list)):
                     new_data[k] = self.process_json_data(
                         v, preserve_technical_keys, strict_context,
@@ -5474,6 +5487,9 @@ class ModTranslatorApp:
                     if ((not strict_context or _text_parent)
                             and self.should_translate(item)):
                         new_data.append(self.get_translation(item))
+                    elif ((not strict_context or _text_parent)
+                            and self._has_cjk_text(item)):
+                        new_data.append(self._to_traditional(item))
                     else:
                         new_data.append(item)
                 elif isinstance(item, (dict, list)):
