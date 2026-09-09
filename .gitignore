@@ -41,3 +41,7 @@ app_icon_source.png
 _client_out/
 runtime_backups/
 exe_backups/
+
+# Local progress notes (keep offline)
+修復進度.md
+
