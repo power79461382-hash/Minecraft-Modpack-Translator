@@ -8,9 +8,9 @@ Minecraft Modpack Translator 是一個面向 Minecraft 大型整合包的 Window
 
 一般使用者不需要安裝 Python。請到 GitHub Releases 下載最新版：
 
-- 目前最新版：**v1.2.1**（2026-09-09）
+- 目前最新版：**v1.2.2**（2026-09-09）
 - 下載頁：[Releases / 最新版](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/latest)
-- 直接下載：[MinecraftTranslatorGUI.exe（v1.2.1）](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/download/v1.2.1/MinecraftTranslatorGUI.exe)
+- 直接下載：[MinecraftTranslatorGUI.exe（v1.2.2）](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/download/v1.2.2/MinecraftTranslatorGUI.exe)
 - 檔案名稱：`MinecraftTranslatorGUI.exe`
 - 系統需求：Windows 10/11，建議放在可寫入的資料夾中執行
 - 使用方式：下載後直接雙擊啟動，選擇整合包資料夾，按「分析檔案」後再開始翻譯
@@ -167,6 +167,7 @@ tests/test_should_translate.py should_translate 邊界條件測試
 tests/test_format_mask.py      格式碼遮罩/還原往返一致性測試
 tests/test_cli.py              CLI 參數解析與過濾邏輯測試
 tests/test_zh_cn_locale_fixes.py 僅 zh_cn 覆蓋、Azure/MyMemory 語系、簡繁後備測試
+tests/test_cache_polish.py       快取載入時格式碼／佔位符自動修復測試
 ```
 
 ## 安全性
@@ -194,6 +195,11 @@ tests/test_zh_cn_locale_fixes.py 僅 zh_cn 覆蓋、Azure/MyMemory 語系、簡�
 ## 專案狀態
 
 目前工具已能處理大型整合包的主要翻譯來源，並已針對常見崩潰原因加上防護：空 `zh_tw` 輸出、FTB Quests type 被翻譯、Patchouli 巨集破壞、Unicode surrogate、已簽名 JAR 與高風險啟動 JAR。
+
+### 2026-09-09 v1.2.2 快取格式自動修復
+
+- 載入翻譯快取時自動 polish：修 `% s`、`§ a`、`] (`、括號內被插空白的 `%s` 等機器／AI 常見損壞，並寫回快取。
+- 補強 `fix_placeholders`（含 `&` 色碼、`%.2f` 類格式）。
 
 ### 2026-09-09 v1.2.1 語系覆蓋與打包修復
 
