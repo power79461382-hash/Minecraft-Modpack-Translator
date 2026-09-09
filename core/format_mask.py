@@ -79,19 +79,29 @@ def _gen_token_id():
 
 
 def fix_placeholders(text):
-    """修復 AI 翻譯中常見的佔位符損壞。"""
+    """修復 AI／機器翻譯中常見的佔位符與格式碼損壞。
+
+    在翻譯寫入時與快取載入時都會用到，用來自動修：
+    `% s`、`§ a`、`] (`、括號內被插空白的 `%s` 等。
+    """
     if not isinstance(text, str):
         return text
     text = re.sub(r'％((?:\d+\$)?[a-zA-Z])', r'%\1', text)
     text = re.sub(r'%\s*(\d+)\s*\$\s*([a-zA-Z])', r'%\1$\2', text)
-    text = re.sub(r'%\s+([a-zA-Z])',              r'%\1',     text)
-    text = re.sub(r'\\\s+n',                       r'\\n',    text)
-    text = re.sub(r'§\s+([0-9a-fk-or])',           r'§\1',    text)
-    text = re.sub(r'\]\s+\(',                      '](',     text)
-    text = re.sub(r'!\s+\[',                       '![',     text)
+    text = re.sub(r'%\s+([a-zA-Z])', r'%\1', text)
+    text = re.sub(r'%\s*\.\s*(\d+)\s*([fd])', r'%.\1\2', text)
+    text = re.sub(r'\\\s+n', r'\\n', text)
+    # § / & 色碼：修「符號與代碼之間」的空白
+    text = re.sub(r'([&§])\s+([0-9a-fk-or])', r'\1\2', text, flags=re.IGNORECASE)
+    # 括號／引號內被插空白的 printf
+    text = re.sub(r'\[\s+(%(?:\d+\$)?[a-zA-Z])\s+\]', r'[\1]', text)
+    text = re.sub(r'\(\s+(%(?:\d+\$)?[a-zA-Z])\s+\)', r'(\1)', text)
+    text = re.sub(r'"\s+(%(?:\d+\$)?[a-zA-Z])\s+"', r'"\1"', text)
+    text = re.sub(r'\]\s+\(', '](', text)
+    text = re.sub(r'!\s+\[', '![', text)
     text = repair_patchouli_macros(text)
-    text = re.sub(r'\[\s+',                        r'[',      text)
-    text = re.sub(r'\s+\]',                        r']',      text)
+    text = re.sub(r'\[\s+', r'[', text)
+    text = re.sub(r'\s+\]', r']', text)
     return text
 
 

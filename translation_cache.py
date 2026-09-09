@@ -13,6 +13,7 @@ from collections.abc import MutableMapping
 from typing import Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 from translation_packager import sanitize_text, sanitize_value
+from core.format_mask import fix_placeholders
 
 
 _RE_ROMAN_TOKEN = re.compile(
@@ -132,7 +133,7 @@ class TranslationCacheStore(MutableMapping):
     def __setitem__(self, key: str, value: str) -> None:
         with self._lock:
             safe_key = sanitize_text(str(key))
-            safe_value = sanitize_text(str(value))
+            safe_value = sanitize_text(fix_placeholders(str(value)))
             if _entry_valid(safe_key, safe_value, self._format_re, self._is_valid):
                 # 只有「尚未在 _pending 且不在 DB」的 key 才算新增
                 if safe_key not in self._pending:
@@ -236,6 +237,40 @@ class TranslationCacheStore(MutableMapping):
         except KeyError:
             return default
 
+
+    def polish_placeholders(self) -> int:
+        """載入後掃描快取，自動修復損壞的格式碼／佔位符並寫回。
+
+        回傳實際被修正的筆數。只更新「修好後仍通過驗證」的條目，
+        不會在此刪除無效條目（那是 validate_and_clean 的工作）。
+        """
+        with self._lock:
+            self._flush_pending_locked()
+            rows = list(self._db.execute("SELECT source, translated FROM cache"))
+            updates = []
+            for source, translated in rows:
+                if not isinstance(translated, str) or not translated:
+                    continue
+                fixed = fix_placeholders(translated)
+                if fixed == translated:
+                    continue
+                safe_key = sanitize_text(str(source))
+                safe_value = sanitize_text(fixed)
+                if not _entry_valid(
+                        safe_key, safe_value, self._format_re, self._is_valid):
+                    continue
+                updates.append((safe_value, safe_key))
+                # pending 也同步，避免讀到舊值
+                if safe_key in self._pending:
+                    self._pending[safe_key] = safe_value
+            if updates:
+                self._db.executemany(
+                    "UPDATE cache SET translated = ? WHERE source = ?",
+                    updates,
+                )
+                self._db.commit()
+            return len(updates)
+
     def validate_and_clean(self) -> int:
         """掃描整個快取，移除無效條目。回傳移除的數量。
 
@@ -316,7 +351,7 @@ class TranslationCacheStore(MutableMapping):
             valid_updates = {}
             for key, value in items:
                 safe_key = sanitize_text(str(key))
-                safe_value = sanitize_text(str(value))
+                safe_value = sanitize_text(fix_placeholders(str(value)))
                 if _entry_valid(safe_key, safe_value, self._format_re, self._is_valid):
                     valid_updates[safe_key] = safe_value
                     written += 1
@@ -479,7 +514,11 @@ def _migrate_legacy_cache(cache_file: str, store: TranslationCacheStore,
 
 def load_translation_cache(cache_file: str, format_re,
                            is_valid_translation: Callable[[str, str], bool]):
-    """載入 SQLite 快取，必要時自動從舊 shelve/pkl/json 遷移。"""
+    """載入 SQLite 快取，必要時自動從舊 shelve/pkl/json 遷移。
+
+    開啟後會自動 polish 快取中損壞的格式碼／佔位符（如 `% s`、`§ a`），
+    並把修正結果寫回，避免舊差譯一直殘留。
+    """
     messages: List[str] = []
     try:
         messages.extend(_repair_shelve_sidecars(cache_file))
@@ -487,6 +526,10 @@ def load_translation_cache(cache_file: str, format_re,
         if (not _sqlite_has_files(cache_file) or len(store) == 0):
             messages.extend(_migrate_legacy_cache(
                 cache_file, store, format_re, is_valid_translation))
+        polished = store.polish_placeholders()
+        if polished:
+            messages.append(
+                f"✅ 已自動修復快取中 {polished:,} 筆損壞的格式碼／佔位符")
         return store, messages
     except Exception as e:
         messages.append(f"⚠️ SQLite 快取開啟失敗，改用記憶體快取：{e}")
@@ -547,7 +590,7 @@ def review_and_fix_cache(
             continue
 
         safe_source = sanitize_text(source)
-        fixed = sanitize_text(to_traditional(translated))
+        fixed = sanitize_text(to_traditional(fix_placeholders(translated)))
         if not is_valid_translation(safe_source, fixed):
             removed += 1
             continue
