@@ -22,7 +22,8 @@ def translation_worker_limit(max_workers, primary_id, engine):
     if primary_id == 'bing':
         return min(max_workers, 4)
     if primary_id == 'gtx':
-        return min(max_workers, 8)
+        # GTX-only 高速路徑：提高並發，靠 gate + 429 退避控速
+        return min(max_workers, 16)
     if primary_id == 'azure':
         return min(max_workers, 5)
     if primary_id in ('mymemory', 'libretranslate'):
@@ -38,7 +39,7 @@ def engine_concurrency_limit(max_workers, engine_id):
     if engine_id == 'azure':
         return min(max_workers, 5)
     if engine_id == 'gtx':
-        return min(max_workers, 8)
+        return min(max_workers, 16)
     if engine_id == 'bing':
         return min(max_workers, 4)
     return max_workers
@@ -55,19 +56,19 @@ def translation_fallback_order(engine, primary_id, ai_provider_key=None,
                                azure_available=None):
     """Return fallback route order after the selected primary engine.
 
-    Non-AI mode uses Bing, Azure, and GTX in priority order. A throttled engine
-    is skipped until its cooldown expires without reducing the other engines.
+    Bing 免費 auth 端點已 404 失效；Azure 在高並發下易 429。
+    非 AI 鏈改為 GTX-only，以較大批次衝吞吐並靠限流退避控速。
     """
     if primary_id == "market_ai" and ai_provider_key in (
             "deepseek_v4_flash_free", "openrouter_free_router", "openrouter_free_models", "openrouter"):
-        order = ['bing', 'azure', 'gtx', 'libretranslate', 'google_api']
+        order = ['gtx', 'libretranslate', 'google_api']
     elif engine == "non_ai_chain":
-        order = ['bing', 'azure', 'gtx']
+        order = ['gtx']
     elif engine != "non_ai_chain" and primary_id in (
             "market_ai", "openai", "claude", "google_api", "azure", "deepl"):
-        order = ['bing', 'azure', 'gtx']
+        order = ['gtx']
     else:
-        order = ['bing', 'azure', 'gtx', 'libretranslate', 'google_api']
+        order = ['gtx', 'libretranslate', 'google_api']
     if azure_available is False:
         order = [engine_id for engine_id in order if engine_id != 'azure']
     return order
@@ -324,7 +325,7 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
         'claude': 'claude',
         'openai': 'openai',
         'market_ai': 'market_ai',
-        'non_ai_chain': 'bing',
+        'non_ai_chain': 'gtx',
         'local':  'local',
     }.get(engine, 'gtx')
     if engine == "market_ai" and ai_provider_key == "libretranslate":

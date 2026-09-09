@@ -49,10 +49,10 @@ GTX_MINECRAFT_GLOSSARY = {
 BING_BATCH_SIZE = 320
 AZURE_BATCH_SIZE = 100
 AZURE_BATCH_CHARS = 45_000
-GTX_GATE_INTERVAL = 0.08
-GTX_BATCH_SIZE = 80
-GTX_BATCH_CHARS = 5000
-GTX_SINGLETON_WORKERS = 8
+GTX_GATE_INTERVAL = 0.05
+GTX_BATCH_SIZE = 128
+GTX_BATCH_CHARS = 9000
+GTX_SINGLETON_WORKERS = 12
 
 
 def parse_retry_after_seconds(value, default=10.0, now=None):
@@ -362,8 +362,8 @@ def build_provider_registry(session, settings):
         except Exception:
             local_session.headers.update({'User-Agent': 'Mozilla/5.0'})
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=4,
-            pool_maxsize=8,
+            pool_connections=8,
+            pool_maxsize=16,
             pool_block=False,
         )
         local_session.mount('https://', adapter)
