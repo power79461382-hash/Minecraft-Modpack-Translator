@@ -8,9 +8,9 @@ Minecraft Modpack Translator 是一個面向 Minecraft 大型整合包的 Window
 
 一般使用者不需要安裝 Python。請到 GitHub Releases 下載最新版：
 
-- 目前最新版：**v1.2.2**（2026-09-09）
+- 目前最新版：**v1.2.3**（2026-09-09）
 - 下載頁：[Releases / 最新版](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/latest)
-- 直接下載：[MinecraftTranslatorGUI.exe（v1.2.2）](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/download/v1.2.2/MinecraftTranslatorGUI.exe)
+- 直接下載：[MinecraftTranslatorGUI.exe（v1.2.3）](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/download/v1.2.3/MinecraftTranslatorGUI.exe)
 - 檔案名稱：`MinecraftTranslatorGUI.exe`
 - 系統需求：Windows 10/11，建議放在可寫入的資料夾中執行
 - 使用方式：下載後直接雙擊啟動，選擇整合包資料夾，按「分析檔案」後再開始翻譯
@@ -26,7 +26,7 @@ Minecraft Modpack Translator 是一個面向 Minecraft 大型整合包的 Window
 - 翻譯部分 advancement、Origins/OpenLoader JSON、Apotheosis 命名表、Markdown 與 SNBT 字串。
 - 支援「補缺」、「跳過高命中項」、「強制重翻」與「只補缺漏 + 模組更新偵測」。
 - 使用全域翻譯記憶池與 SQLite / shelve 快取，降低重複翻譯與重複掃描成本。
-- 非 AI 翻譯鏈目前以 `Bing -> Azure -> GTX` 為主，遇到限流或錯誤會自動切換下一個可用引擎。
+- 非 AI 翻譯鏈目前以 **GTX-only** 為主（Bing 免費 auth 已失效、Azure 易 429）；以大批次提高詞/秒，遇限流自動退避重試。
 - 支援多種 API / OpenAI-compatible 模型，用於需要更好語意品質的付費或免費額度翻譯。
 - 內建格式保護：Minecraft 顏色碼、placeholder、指令、URL、registry id、FTB/Patchouli token、數值單位與 Unicode surrogate 會被過濾或遮罩。
 - 輸出前會驗證翻譯量，避免產生空 `zh_tw.json` 或看似完成但內容沒有翻譯的語言包。
@@ -195,6 +195,12 @@ tests/test_cache_polish.py       快取載入時格式碼／佔位符自動修�
 ## 專案狀態
 
 目前工具已能處理大型整合包的主要翻譯來源，並已針對常見崩潰原因加上防護：空 `zh_tw` 輸出、FTB Quests type 被翻譯、Patchouli 巨集破壞、Unicode surrogate、已簽名 JAR 與高風險啟動 JAR。
+
+### 2026-09-09 v1.2.3 GTX-only 高速路徑
+
+- 非 AI 鏈停用 Bing／Azure，只走 GTX。
+- 提高 GTX 批次（128／9000 字）、略降閘門間隔、提高並發；以「更大批次」衝詞/秒，比狂發請求更不易觸發限流。
+- 遇 429 仍會自動退避後重試。
 
 ### 2026-09-09 v1.2.2 快取格式自動修復
 

@@ -3461,7 +3461,7 @@ class ModTranslatorApp:
             "claude": "Claude API 建議 4~8（Token 計費，不宜過高）",
             "openai": "OpenAI API 建議 4~8（Token 計費，不宜過高）",
             "market_ai": "市面 AI 模型建議 3~6；OpenRouter/Groq/本地可依速率上限調整",
-            "non_ai_chain": "非 AI 翻譯鏈：Bing → Azure → GTX；限流時自動切換下一個",
+            "non_ai_chain": "非 AI 翻譯鏈：僅 GTX（高速批次）；遇限流自動退避後重試",
             "local":  "本地 AI 建議 2~4（受限於本機 GPU/CPU）",
         }
         self.workers_hint.config(text=hints.get(engine, ""))
@@ -3471,7 +3471,7 @@ class ModTranslatorApp:
     def _on_engine_route_change(self):
         self._on_engine_change()
         if self.engine_var.get() == "non_ai_chain":
-            self.log("INFO  已切換為非 AI 翻譯鏈：優先 Bing → Azure → GTX；限流時自動切換，不使用市面 AI 模型。")
+            self.log("INFO  已切換為非 AI 翻譯鏈：僅使用 GTX（Bing/Azure 已停用）；以大批次衝速，限流時自動退避。")
 
     def _refresh_engine_route_ui(self):
         if not hasattr(self, "ai_provider_menu_row"):
@@ -3503,7 +3503,7 @@ class ModTranslatorApp:
                 self.ai_provider_hint.config(text=cfg.get("hint", ""))
             else:
                 self.ai_provider_hint.config(
-                    text="非 AI 模式優先使用 Bing → Azure → GTX；Azure 沒有 Key 時自動略過，限流時自動切換下一個。")
+                    text="非 AI 模式僅使用 GTX（Bing 免費通道已失效、Azure 易限流）。以大批次提高詞/秒，遇 429 自動退避。")
 
     # ═══════════════════════════════════════════════
     #  輸出格式切換 → 更新提示文字
@@ -5059,7 +5059,8 @@ class ModTranslatorApp:
                 return 50, 11000
             return 32, 7500
         if primary_id == 'gtx':
-            return 80, 5200
+            # 大批次：同樣 QPS 下更高詞/秒，比狂加請求更不易觸發限流
+            return 128, 9200
         if primary_id == 'bing':
             # Bing 端點可穩定吃較大的批次；小批次會產生太多請求，
             # 在第二階段救援時容易把吞吐拉低到 20~40 詞/秒。

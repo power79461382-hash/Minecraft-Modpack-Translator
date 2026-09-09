@@ -858,10 +858,10 @@ class AnalysisScanFilterTests(unittest.TestCase):
 
 
 class AdaptiveConcurrencyTests(unittest.TestCase):
-    def test_non_ai_fallback_order_prioritizes_bing_azure_gtx(self):
+    def test_non_ai_fallback_order_is_gtx_only(self):
         self.assertEqual(
-            translation_fallback_order("non_ai_chain", "bing"),
-            ["bing", "azure", "gtx"],
+            translation_fallback_order("non_ai_chain", "gtx"),
+            ["gtx"],
         )
 
     def test_engine_selection_uses_priority_and_skips_throttled_engine(self):
@@ -887,13 +887,13 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
         self.assertEqual(
             translation_fallback_order(
                 "market_ai", "market_ai", "deepseek_v4_flash_free"),
-            ["bing", "azure", "gtx", "libretranslate", "google_api"],
+            ["gtx", "libretranslate", "google_api"],
         )
 
     def test_non_ai_timeout_fails_over_instead_of_splitting(self):
         self.assertFalse(should_split_timeout_batch("non_ai_chain", "bing", 320))
         self.assertFalse(should_split_timeout_batch("non_ai_chain", "azure", 320))
-        self.assertFalse(should_split_timeout_batch("non_ai_chain", "gtx", 80))
+        self.assertFalse(should_split_timeout_batch("non_ai_chain", "gtx", 128))
 
     def test_non_ai_slow_success_can_soft_throttle(self):
         self.assertEqual(soft_throttle_after_success("non_ai_chain", "bing", 320, 4.0), 0.0)
@@ -930,7 +930,7 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
     def test_translation_worker_limit_caps_bing_large_batch_burst(self):
         self.assertEqual(translation_worker_limit(16, "bing", "non_ai_chain"), 4)
         self.assertEqual(translation_worker_limit(32, "bing", "non_ai_chain"), 4)
-        self.assertEqual(translation_worker_limit(16, "gtx", "non_ai_chain"), 8)
+        self.assertEqual(translation_worker_limit(16, "gtx", "non_ai_chain"), 16)
         self.assertEqual(translation_worker_limit(16, "mymemory", "non_ai_chain"), 4)
         self.assertEqual(translation_worker_limit(16, "deepseek", "market_ai"), 8)
 
