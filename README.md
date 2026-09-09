@@ -8,17 +8,19 @@ Minecraft Modpack Translator 是一個面向 Minecraft 大型整合包的 Window
 
 一般使用者不需要安裝 Python。請到 GitHub Releases 下載最新版：
 
-- 下載頁：[MinecraftTranslatorGUI.exe](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/latest)
+- 目前最新版：**v1.2.1**（2026-09-09）
+- 下載頁：[Releases / 最新版](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/latest)
+- 直接下載：[MinecraftTranslatorGUI.exe（v1.2.1）](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/download/v1.2.1/MinecraftTranslatorGUI.exe)
 - 檔案名稱：`MinecraftTranslatorGUI.exe`
 - 系統需求：Windows 10/11，建議放在可寫入的資料夾中執行
 - 使用方式：下載後直接雙擊啟動，選擇整合包資料夾，按「分析檔案」後再開始翻譯
 
-第一次執行時，Windows Defender 或 SmartScreen 可能會提示未簽章程式。此 EXE 是由本專案源碼使用 PyInstaller 打包，不包含個人 API 設定檔、翻譯快取、輸出 ZIP 或 Minecraft 模組包。
+第一次執行時，Windows Defender 或 SmartScreen 可能會提示未簽章程式。此 EXE 是由本專案源碼使用 PyInstaller 打包（含 OpenCC 簡轉繁詞典），不包含個人 API 設定檔、翻譯快取、輸出 ZIP 或 Minecraft 模組包。
 
 ## 目前能做到什麼
 
 - 自動分析整合包根目錄、`mods/`、`config/`、`defaultconfigs/`、resource pack、OpenLoader 與 Paxi 覆蓋目錄。
-- 從 JAR 內擷取 `assets/<modid>/lang/en_us.json`、`zh_cn.json`、legacy `.lang`，產生或補齊 `zh_tw`。
+- 從 JAR 內擷取 `assets/<modid>/lang/en_us.json`、`zh_cn.json`、legacy `.lang`，產生或補齊 `zh_tw`；僅有 `zh_cn`、沒有 `en_us` 的模組會走簡→繁，避免繁中包幾乎空白。
 - 翻譯 Patchouli 與相似書本格式，並避免把頁面巨集、連結、圖片、recipe 標記翻壞。
 - 翻譯 FTB Quests / KubeJS 任務文字，同時保護 task type、item id、NBT、image macro、pagebreak 與條件語法。
 - 翻譯部分 advancement、Origins/OpenLoader JSON、Apotheosis 命名表、Markdown 與 SNBT 字串。
@@ -164,6 +166,7 @@ tests/test_translation_core.py 核心行為測試
 tests/test_should_translate.py should_translate 邊界條件測試
 tests/test_format_mask.py      格式碼遮罩/還原往返一致性測試
 tests/test_cli.py              CLI 參數解析與過濾邏輯測試
+tests/test_zh_cn_locale_fixes.py 僅 zh_cn 覆蓋、Azure/MyMemory 語系、簡繁後備測試
 ```
 
 ## 安全性
@@ -191,6 +194,15 @@ tests/test_cli.py              CLI 參數解析與過濾邏輯測試
 ## 專案狀態
 
 目前工具已能處理大型整合包的主要翻譯來源，並已針對常見崩潰原因加上防護：空 `zh_tw` 輸出、FTB Quests type 被翻譯、Patchouli 巨集破壞、Unicode surrogate、已簽名 JAR 與高風險啟動 JAR。
+
+### 2026-09-09 v1.2.1 語系覆蓋與打包修復
+
+已發佈 [v1.2.1 Release](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/tag/v1.2.1)，Windows EXE 可直接下載。主要修復：
+
+- **僅有 `zh_cn` 的模組**：已是中文的字串改走簡→繁；`drop_untranslated` 不再因簡繁同形字把 key 整包丟掉，避免 `zh_tw` 幾乎空白。
+- **Azure / MyMemory**：Azure 拿掉硬編碼 `from=en`，改自動偵測來源；MyMemory 對 CJK 來源改用 `zh-CN|zh-TW`。
+- **OpenCC 打包**：PyInstaller `.spec` 以 `collect_all('opencc')` 帶上詞典；無 OpenCC 時的簡繁後備表／詞組也已補強。
+- **測試**：新增 `tests/test_zh_cn_locale_fixes.py`。
 
 ### 2026-07-08 程式碼優化與重構
 
