@@ -1149,7 +1149,7 @@ class ModTranslatorApp:
                       font=("微軟正黑體", 15),
                       relief="flat", bd=0, cursor="hand2",
                       width=3).pack(side=tk.LEFT, padx=(0, 10))
-        tk.Label(sidebar, text="v1.2.8", bg=panel2, fg=muted,
+        tk.Label(sidebar, text="v1.2.9", bg=panel2, fg=muted,
                  font=("Consolas", 9), anchor="w").pack(
                      side=tk.BOTTOM, fill=tk.X, padx=22, pady=(0, 10))
 
@@ -1841,7 +1841,7 @@ class ModTranslatorApp:
             "claude": "Claude",
             "openai": "OpenAI",
             "local": "本地 AI",
-            "non_ai_chain": "非 AI 翻譯鏈：僅用 GTX（其他免費通道已移除）",
+            "non_ai_chain": "非 AI 翻譯鏈：僅用 GTX 高速大批次（遇 429 自動退避）",
         }
         label = engine_names.get(engine, engine or "--")
         return "已設定", f"引擎：{label}", self.C_SUCCESS
@@ -2365,7 +2365,7 @@ class ModTranslatorApp:
     def show_about(self):
         msg = (
             "Minecraft 模組翻譯器\n"
-            "版本：v1.2.8\n"
+            "版本：v1.2.9\n"
             "預設模型：DeepSeek V4 Flash Free (OpenRouter)\n"
             "支援：JAR 直接翻譯、自動判定、全域記憶池與多 API 模型"
         )
@@ -3443,7 +3443,7 @@ class ModTranslatorApp:
 
         # 更新執行緒建議文字
         hints = {
-            "google": "GTX 建議 6~8 ｜ 有 API Key 時建議 15~20",
+            "google": "GTX 建議 8~16（大批次高速；遇 429 自動退避）｜有 API Key 時可更高",
             "deepl":  "DeepL 建議 10~16（免費版有並發限制，勿超過 16）",
             "azure":  "Azure 免費版建議 3~5（超過容易 429 限流）｜付費版可提高至 10~15",
             "claude": "Claude API 建議 8~16（Token 計費；遇 429 再降）",

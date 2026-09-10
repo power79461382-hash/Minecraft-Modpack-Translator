@@ -22,8 +22,8 @@ def translation_worker_limit(max_workers, primary_id, engine):
     if primary_id == 'bing':
         return min(max_workers, 4)
     if primary_id == 'gtx':
-        # 單線程 + 長間隔，避免觸發 GTX 429
-        return 1
+        # GTX high throughput; gate + 429 cooldown pace requests
+        return min(max_workers, 16)
     if primary_id == 'azure':
         return min(max_workers, 5)
     if primary_id in ('mymemory', 'libretranslate'):
@@ -40,7 +40,7 @@ def engine_concurrency_limit(max_workers, engine_id):
     if engine_id == 'azure':
         return min(max_workers, 5)
     if engine_id == 'gtx':
-        return 1
+        return min(max_workers, 16)
     if engine_id == 'bing':
         return min(max_workers, 4)
     return max_workers
