@@ -1,53 +1,87 @@
+from pathlib import Path
+
+from core.analysis_scan import apply_pcl_java_runtime_select
 from core.translation_flow import confirm_java_runtime_before_translation
 
 
 class _App:
-    def __init__(self, answer):
-        self._java_runtime_compatibility_report = {
-            "status": "incompatible",
-            "is_incompatible": True,
-            "minecraft_version": "1.19.2",
-            "required_java_major": 17,
-            "actual_java_major": 25,
-            "recommended_java_path": (
-                r"C:\Program Files\Eclipse Adoptium\jdk-17\bin\java.exe"),
-        }
-        self.answer = answer
+    def __init__(self, report, analyzed_mc_dir=None):
+        self._java_runtime_compatibility_report = report
+        self.analyzed_mc_dir = analyzed_mc_dir
         self.prompts = []
         self.logs = []
 
     def _ask_proceed_from_thread(self, title, message):
         self.prompts.append((title, message))
-        return self.answer
+        return False
 
     def log(self, message):
         self.logs.append(message)
 
 
-def test_java_25_blocks_translation_until_user_confirms_java_17_switch():
-    app = _App(answer=False)
+def _incompatible_report(tmp_path, java_exe):
+    return {
+        "status": "incompatible",
+        "is_incompatible": True,
+        "minecraft_version": "1.20.1",
+        "instance_dir": str(tmp_path),
+        "required_java_major": 17,
+        "actual_java_major": 21,
+        "recommended_java_path": str(java_exe),
+    }
 
-    assert confirm_java_runtime_before_translation(app) is False
-    assert len(app.prompts) == 1
-    title, message = app.prompts[0]
-    assert "Java" in title
-    assert "Java 25" in message
-    assert "Java 17" in message
-    assert "jdk-17" in message
-    assert any("已取消" in line for line in app.logs)
 
+def test_incompatible_runtime_auto_writes_pcl_setup_without_prompt(tmp_path):
+    java_exe = tmp_path / "jdk-17" / "bin" / "java.exe"
+    java_exe.parent.mkdir(parents=True)
+    java_exe.write_text("", encoding="utf-8")
+    instance = tmp_path / "versions" / "Demo"
+    (instance / "PCL").mkdir(parents=True)
+    setup = instance / "PCL" / "Setup.ini"
+    setup.write_text("State:6\nInfo:demo\n", encoding="utf-8")
 
-def test_java_25_can_continue_only_after_explicit_confirmation():
-    app = _App(answer=True)
-
+    app = _App(_incompatible_report(instance, java_exe), analyzed_mc_dir=str(instance))
     assert confirm_java_runtime_before_translation(app) is True
-    assert len(app.prompts) == 1
-    assert any("已確認" in line for line in app.logs)
+    assert app.prompts == []
+    assert any("已自動將 PCL" in line for line in app.logs)
+
+    content = setup.read_text(encoding="utf-8")
+    assert "VersionArgumentJavaSelect:{" in content
+    assert "jdk-17" in content.replace("\\", "/")
+    assert "VersionArgumentJavaV2:3" in content
+    assert "State:6" in content
+    assert "Info:demo" in content
+
+
+def test_incompatible_without_java_still_continues_without_prompt(tmp_path):
+    app = _App({
+        "status": "incompatible",
+        "is_incompatible": True,
+        "minecraft_version": "1.20.1",
+        "instance_dir": str(tmp_path),
+        "required_java_major": 17,
+        "actual_java_major": 21,
+        "recommended_java_path": None,
+    })
+    assert confirm_java_runtime_before_translation(app) is True
+    assert app.prompts == []
+    assert any("無法自動切換" in line for line in app.logs)
 
 
 def test_compatible_or_unknown_runtime_does_not_prompt():
-    app = _App(answer=False)
-    app._java_runtime_compatibility_report = {"status": "compatible"}
-
+    app = _App({"status": "compatible"})
     assert confirm_java_runtime_before_translation(app) is True
     assert app.prompts == []
+
+
+def test_apply_pcl_java_runtime_select_upserts_ini(tmp_path):
+    java_exe = tmp_path / "bin" / "java.exe"
+    java_exe.parent.mkdir(parents=True)
+    java_exe.write_text("", encoding="utf-8")
+    instance = tmp_path / "inst"
+    ok, detail = apply_pcl_java_runtime_select(str(instance), str(java_exe), major=17)
+    assert ok is True
+    text = Path(detail).read_text(encoding="utf-8")
+    assert "VersionArgumentJavaSelect:{" in text
+    assert '"Path":' in text
+    assert "VersionArgumentJavaV2:3" in text

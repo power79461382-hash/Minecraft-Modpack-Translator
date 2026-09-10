@@ -109,7 +109,7 @@ def test_record_diagnostic_stores_report_and_logs_actionable_warning(tmp_path):
     assert "Java 21" in combined
     assert "Java 17" in combined
     assert "不是翻譯包或 Paxi 錯誤" in combined
-    assert "翻譯前" in combined
+    assert "會自動把 PCL" in combined
 
 
 def test_java_17_installation_path_is_reported_when_available(

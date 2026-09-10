@@ -616,6 +616,7 @@ def inspect_java_runtime_compatibility(instance_dir, minecraft_version=None):
         'reason': None,
         'is_incompatible': False,
         'minecraft_version': minecraft_version,
+        'instance_dir': instance_dir,
         'required_java_major': None,
         'actual_java_major': None,
         'recommended_java_major': None,
@@ -682,7 +683,7 @@ def inspect_java_runtime_compatibility(instance_dir, minecraft_version=None):
 
 
 def java_runtime_warning_lines(report):
-    """Return a clear Java compatibility warning for logs and blocking UI."""
+    """Return a clear Java compatibility warning for logs and UI."""
     if not isinstance(report, dict) or report.get('status') != 'incompatible':
         return []
     minecraft_version = report.get('minecraft_version') or '未知'
@@ -691,14 +692,88 @@ def java_runtime_warning_lines(report):
     lines = [
         (f"\n⚠️ Java 版本不相容：Minecraft {minecraft_version} / "
          f"版本 JSON 要求 Java {required_java}，latest.log 顯示 Java {actual_java}。"),
-        "   這不是翻譯包或 Paxi 錯誤；翻譯器不會修改 Java 或遊戲實例。",
-        (f"   請先在啟動器將此實例固定為 Java {required_java}，"
-         "翻譯前會要求明確確認。"),
+        (f"   這不是翻譯包或 Paxi 錯誤；翻譯開始時會自動把 PCL 此版本"
+         f"切到本機 Java {required_java}（若找得到）。"),
     ]
     java_path = report.get('recommended_java_path')
     if java_path:
         lines.append(f"   本機可用 Java {required_java}：{java_path}")
     return lines
+
+
+def _pcl_java_entry_json(java_exe_path, major=17):
+    """Build PCL JavaEntry JSON (Path = bin folder with trailing slash)."""
+    java_exe_path = os.path.abspath(os.path.normpath(java_exe_path))
+    folder = os.path.dirname(java_exe_path).replace('/', '\\')
+    if not folder.endswith('\\'):
+        folder += '\\'
+    major = int(major)
+    version_string = f'1.{major}.0.0' if major <= 8 else f'{major}.0.0'
+    return {
+        'Path': folder,
+        'VersionString': version_string,
+        'IsJre': False,
+        'Is64Bit': True,
+        'IsUserImport': True,
+    }
+
+
+def _upsert_pcl_setup_ini(ini_path, updates):
+    """Upsert Key:Value lines in a PCL Setup.ini without wiping other keys."""
+    existing = []
+    if os.path.isfile(ini_path):
+        with open(ini_path, 'r', encoding='utf-8-sig', errors='replace') as handle:
+            existing = handle.read().splitlines()
+
+    seen = set()
+    out_lines = []
+    for line in existing:
+        stripped = line.strip()
+        if not stripped or ':' not in stripped:
+            out_lines.append(line)
+            continue
+        key, _sep, _value = stripped.partition(':')
+        if key in updates:
+            out_lines.append(f'{key}:{updates[key]}')
+            seen.add(key)
+        else:
+            out_lines.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            out_lines.append(f'{key}:{value}')
+
+    parent = os.path.dirname(ini_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    payload = '\n'.join(out_lines).rstrip() + '\n'
+    with open(ini_path, 'w', encoding='utf-8', newline='\n') as handle:
+        handle.write(payload)
+    return ini_path
+
+
+def apply_pcl_java_runtime_select(instance_dir, java_exe_path, major=17):
+    """Write PCL per-version Java select to the recommended runtime.
+
+    Returns (ok: bool, detail: str).
+    """
+    if not instance_dir or not java_exe_path:
+        return False, 'missing_instance_or_java_path'
+    instance_dir = os.path.abspath(os.path.normpath(instance_dir))
+    java_exe_path = os.path.abspath(os.path.normpath(java_exe_path))
+    if not os.path.isfile(java_exe_path):
+        return False, f'java_exe_missing:{java_exe_path}'
+
+    entry = _pcl_java_entry_json(java_exe_path, major=major)
+    select_value = json.dumps(entry, ensure_ascii=False, separators=(',', ':'))
+    ini_path = os.path.join(instance_dir, 'PCL', 'Setup.ini')
+    try:
+        _upsert_pcl_setup_ini(ini_path, {
+            'VersionArgumentJavaSelect': select_value,
+            'VersionArgumentJavaV2': '3',
+        })
+    except OSError as exc:
+        return False, f'write_failed:{exc}'
+    return True, ini_path
 
 
 def record_java_runtime_diagnostics(
