@@ -269,8 +269,8 @@ class ProviderHelperTests(unittest.TestCase):
         )
 
     def test_gtx_gate_uses_fast_fallback_interval(self):
-        self.assertLessEqual(GTX_GATE_INTERVAL, 0.15)
-        self.assertGreaterEqual(GTX_BATCH_SIZE, 40)
+        self.assertGreaterEqual(GTX_GATE_INTERVAL, 0.8)
+        self.assertLessEqual(GTX_BATCH_SIZE, 24)
 
     def test_gtx_numbered_batch_parser_keeps_every_item(self):
         raw = "[[MCT000]] 救贖之戒\n[[ MCT001 ]] 護甲穿透\n[[MCT002]] 冰霜傷害"
@@ -858,10 +858,10 @@ class AnalysisScanFilterTests(unittest.TestCase):
 
 
 class AdaptiveConcurrencyTests(unittest.TestCase):
-    def test_non_ai_fallback_order_is_gtx_only(self):
+    def test_non_ai_fallback_order_prefers_gtx_with_free_backups(self):
         self.assertEqual(
             translation_fallback_order("non_ai_chain", "gtx"),
-            ["gtx"],
+            ["gtx", "mymemory", "libretranslate"],
         )
 
     def test_engine_selection_uses_priority_and_skips_throttled_engine(self):
@@ -887,7 +887,7 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
         self.assertEqual(
             translation_fallback_order(
                 "market_ai", "market_ai", "deepseek_v4_flash_free"),
-            ["gtx", "libretranslate", "google_api"],
+            ["gtx", "mymemory", "libretranslate", "google_api"],
         )
 
     def test_non_ai_timeout_fails_over_instead_of_splitting(self):
@@ -930,7 +930,7 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
     def test_translation_worker_limit_caps_bing_large_batch_burst(self):
         self.assertEqual(translation_worker_limit(16, "bing", "non_ai_chain"), 4)
         self.assertEqual(translation_worker_limit(32, "bing", "non_ai_chain"), 4)
-        self.assertEqual(translation_worker_limit(16, "gtx", "non_ai_chain"), 16)
+        self.assertEqual(translation_worker_limit(16, "gtx", "non_ai_chain"), 1)
         self.assertEqual(translation_worker_limit(16, "mymemory", "non_ai_chain"), 4)
         self.assertEqual(translation_worker_limit(16, "deepseek", "market_ai"), 8)
 

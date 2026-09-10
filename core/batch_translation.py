@@ -22,8 +22,8 @@ def translation_worker_limit(max_workers, primary_id, engine):
     if primary_id == 'bing':
         return min(max_workers, 4)
     if primary_id == 'gtx':
-        # GTX-only 高速路徑：提高並發，靠 gate + 429 退避控速
-        return min(max_workers, 16)
+        # 單線程 + 長間隔，避免觸發 GTX 429
+        return 1
     if primary_id == 'azure':
         return min(max_workers, 5)
     if primary_id in ('mymemory', 'libretranslate'):
@@ -39,7 +39,7 @@ def engine_concurrency_limit(max_workers, engine_id):
     if engine_id == 'azure':
         return min(max_workers, 5)
     if engine_id == 'gtx':
-        return min(max_workers, 16)
+        return 1
     if engine_id == 'bing':
         return min(max_workers, 4)
     return max_workers
@@ -48,7 +48,8 @@ def engine_concurrency_limit(max_workers, engine_id):
 def translation_wait_budget(engine_route, strict_paid_primary):
     """Return the per-chunk cumulative cooldown budget in seconds."""
     if engine_route == 'non_ai_chain' and not strict_paid_primary:
-        return 45
+        # Allow GTX cooldown + MyMemory/LibreTranslate failover before skip.
+        return 180
     return 300
 
 
@@ -57,18 +58,19 @@ def translation_fallback_order(engine, primary_id, ai_provider_key=None,
     """Return fallback route order after the selected primary engine.
 
     Bing 免費 auth 端點已 404 失效；Azure 在高並發下易 429。
-    非 AI 鏈改為 GTX-only，以較大批次衝吞吐並靠限流退避控速。
+    非 AI 鏈以 GTX 為主，MyMemory / LibreTranslate 作為 429 備援，
+    避免單一引擎限流後整批略過。
     """
     if primary_id == "market_ai" and ai_provider_key in (
             "deepseek_v4_flash_free", "openrouter_free_router", "openrouter_free_models", "openrouter"):
-        order = ['gtx', 'libretranslate', 'google_api']
+        order = ['gtx', 'mymemory', 'libretranslate', 'google_api']
     elif engine == "non_ai_chain":
-        order = ['gtx']
+        order = ['gtx', 'mymemory', 'libretranslate']
     elif engine != "non_ai_chain" and primary_id in (
             "market_ai", "openai", "claude", "google_api", "azure", "deepl"):
-        order = ['gtx']
+        order = ['gtx', 'mymemory', 'libretranslate']
     else:
-        order = ['gtx', 'libretranslate', 'google_api']
+        order = ['gtx', 'mymemory', 'libretranslate', 'google_api']
     if azure_available is False:
         order = [engine_id for engine_id in order if engine_id != 'azure']
     return order
@@ -90,7 +92,9 @@ def engine_rate_limit_cooldown(engine_route, engine_id, retry_after):
             "deepl": 60.0,
             "azure": 90.0,
             "bing": 60.0,
-            "gtx": 30.0,
+            "gtx": 90.0,
+            "mymemory": 20.0,
+            "libretranslate": 20.0,
         }
         seconds = max(seconds, minimums.get(engine_id, seconds))
     return max(1.0, seconds)
