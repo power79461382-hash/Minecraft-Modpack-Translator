@@ -29,7 +29,8 @@ def translation_worker_limit(max_workers, primary_id, engine):
     if primary_id in ('mymemory', 'libretranslate'):
         return min(max_workers, 4)
     if engine in ('claude', 'openai', 'market_ai', 'local'):
-        return min(max_workers, 8)
+        # 付費／自架 AI：允許較高並發；實際上限仍受供應商 RPM/TPM 與 429 退避約束
+        return min(max_workers, 16)
     return max_workers
 
 

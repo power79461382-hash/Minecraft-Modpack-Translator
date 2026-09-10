@@ -8,9 +8,9 @@ Minecraft Modpack Translator 是一個面向 Minecraft 大型整合包的 Window
 
 一般使用者不需要安裝 Python。請到 GitHub Releases 下載最新版：
 
-- 目前最新版：**v1.2.7**（2026-09-10）
+- 目前最新版：**v1.2.8**（2026-09-10）
 - 下載頁：[Releases / 最新版](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/latest)
-- 直接下載：[MinecraftTranslatorGUI.exe（v1.2.6）](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/download/v1.2.7/MinecraftTranslatorGUI.exe)
+- 直接下載：[MinecraftTranslatorGUI.exe（v1.2.6）](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/download/v1.2.8/MinecraftTranslatorGUI.exe)
 - 檔案名稱：`MinecraftTranslatorGUI.exe`
 - 系統需求：Windows 10/11，建議放在可寫入的資料夾中執行
 - 使用方式：下載後直接雙擊啟動，選擇整合包資料夾，按「分析檔案」後再開始翻譯
@@ -196,10 +196,10 @@ tests/test_cache_polish.py       快取載入時格式碼／佔位符自動修�
 
 目前工具已能處理大型整合包的主要翻譯來源，並已針對常見崩潰原因加上防護：空 `zh_tw` 輸出、FTB Quests type 被翻譯、Patchouli 巨集破壞、Unicode surrogate、已簽名 JAR 與高風險啟動 JAR。
 
-### 2026-09-10 v1.2.7 付費市面 AI 路由對齊
+### 2026-09-10 v1.2.8 付費市面 AI 路由對齊
 - Base URL 與供應商/api_type 自動對齊，避免 Anthropic 協議打到 DeepSeek 端點後 DISABLED 再落到 GTX。
 - 切換供應商時不再無條件覆寫已自訂的 Base URL。
-- DeepSeek / OpenAI-compatible 支援 `reasoning_content` 回填；UI 版號改為 v1.2.7。
+- DeepSeek / OpenAI-compatible 支援 `reasoning_content` 回填；UI 版號改為 v1.2.8。
 
 ### 2026-09-10 v1.2.5 GTX 安全速率 + 免費備援
 
