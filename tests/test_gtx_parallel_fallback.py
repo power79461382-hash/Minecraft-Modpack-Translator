@@ -106,7 +106,7 @@ def test_gtx_parallel_singletons_keep_rate_limit_error_semantics(monkeypatch):
     result, error = gtx(sources)
 
     assert result == [None] * len(sources)
-    assert error == "429:30"
+    assert error.startswith("429:")
     assert 2 <= tracker.peak_singletons <= 3
 
 

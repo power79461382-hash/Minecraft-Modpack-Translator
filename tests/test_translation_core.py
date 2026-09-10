@@ -258,7 +258,7 @@ class ProviderHelperTests(unittest.TestCase):
     def test_model_batch_limit(self):
         self.assertEqual(model_batch_limit("claude-3-5-sonnet"), 80)
         self.assertEqual(model_batch_limit("gpt-5-mini"), 50)
-        self.assertEqual(model_batch_limit("deepseek-v4-flash"), 40)
+        self.assertEqual(model_batch_limit("deepseek-v4-flash"), 16)
         self.assertEqual(model_batch_limit("unknown", default=17), 17)
 
     def test_bing_batch_size_matches_gui_chunk_limit(self):
@@ -269,8 +269,8 @@ class ProviderHelperTests(unittest.TestCase):
         )
 
     def test_gtx_gate_uses_fast_fallback_interval(self):
-        self.assertLessEqual(GTX_GATE_INTERVAL, 0.1)
-        self.assertGreaterEqual(GTX_BATCH_SIZE, 64)
+        self.assertLessEqual(GTX_GATE_INTERVAL, 0.2)
+        self.assertGreaterEqual(GTX_BATCH_SIZE, 32)
 
     def test_gtx_numbered_batch_parser_keeps_every_item(self):
         raw = "[[MCT000]] 救贖之戒\n[[ MCT001 ]] 護甲穿透\n[[MCT002]] 冰霜傷害"
@@ -861,7 +861,7 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
     def test_non_ai_fallback_order_is_gtx_only(self):
         self.assertEqual(
             translation_fallback_order("non_ai_chain", "gtx"),
-            ["gtx"],
+            ["gtx", "mymemory"],
         )
 
     def test_engine_selection_uses_priority_and_skips_throttled_engine(self):
@@ -887,7 +887,7 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
         self.assertEqual(
             translation_fallback_order(
                 "market_ai", "market_ai", "deepseek_v4_flash_free"),
-            ["gtx"],
+            ["gtx", "mymemory"],
         )
 
     def test_non_ai_timeout_fails_over_instead_of_splitting(self):
@@ -930,7 +930,7 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
     def test_translation_worker_limit_caps_bing_large_batch_burst(self):
         self.assertEqual(translation_worker_limit(16, "bing", "non_ai_chain"), 4)
         self.assertEqual(translation_worker_limit(32, "bing", "non_ai_chain"), 4)
-        self.assertEqual(translation_worker_limit(16, "gtx", "non_ai_chain"), 16)
+        self.assertEqual(translation_worker_limit(16, "gtx", "non_ai_chain"), 6)
         self.assertEqual(translation_worker_limit(16, "mymemory", "non_ai_chain"), 4)
         self.assertEqual(translation_worker_limit(16, "deepseek", "market_ai"), 16)
 

@@ -266,4 +266,4 @@ def test_non_ai_fallback_order_is_gtx_only():
         "non_ai_chain",
         "gtx",
         azure_available=False,
-    ) == ["gtx"]
+    ) == ["gtx", "mymemory"]
