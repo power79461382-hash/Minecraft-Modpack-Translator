@@ -8,9 +8,9 @@ Minecraft Modpack Translator 是一個面向 Minecraft 大型整合包的 Window
 
 一般使用者不需要安裝 Python。請到 GitHub Releases 下載最新版：
 
-- 目前最新版：**v1.2.3**（2026-09-09）
+- 目前最新版：**v1.2.4**（2026-09-10）
 - 下載頁：[Releases / 最新版](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/latest)
-- 直接下載：[MinecraftTranslatorGUI.exe（v1.2.3）](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/download/v1.2.3/MinecraftTranslatorGUI.exe)
+- 直接下載：[MinecraftTranslatorGUI.exe（v1.2.4）](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/download/v1.2.4/MinecraftTranslatorGUI.exe)
 - 檔案名稱：`MinecraftTranslatorGUI.exe`
 - 系統需求：Windows 10/11，建議放在可寫入的資料夾中執行
 - 使用方式：下載後直接雙擊啟動，選擇整合包資料夾，按「分析檔案」後再開始翻譯
