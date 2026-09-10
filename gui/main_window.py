@@ -770,6 +770,8 @@ class ModTranslatorApp:
         self._log_queue = deque()
         self._log_lock = threading.Lock()
         self._log_polling = False
+        # Tracks last provider preset Base URL so user-edited URLs are kept.
+        self._last_ai_default_url = None
 
         self._configure_window_icon()
         self.setup_ui_imagegen()
@@ -1147,7 +1149,7 @@ class ModTranslatorApp:
                       font=("微軟正黑體", 15),
                       relief="flat", bd=0, cursor="hand2",
                       width=3).pack(side=tk.LEFT, padx=(0, 10))
-        tk.Label(sidebar, text="v1.2.2", bg=panel2, fg=muted,
+        tk.Label(sidebar, text="v1.2.7", bg=panel2, fg=muted,
                  font=("Consolas", 9), anchor="w").pack(
                      side=tk.BOTTOM, fill=tk.X, padx=22, pady=(0, 10))
 
@@ -2363,7 +2365,7 @@ class ModTranslatorApp:
     def show_about(self):
         msg = (
             "Minecraft 模組翻譯器\n"
-            "版本：v1.2.2\n"
+            "版本：v1.2.7\n"
             "預設模型：DeepSeek V4 Flash Free (OpenRouter)\n"
             "支援：JAR 直接翻譯、自動判定、全域記憶池與多 API 模型"
         )
@@ -2776,7 +2778,12 @@ class ModTranslatorApp:
             self.ai_model_var.set(models[0])
 
         default_url = cfg.get("base_url", "")
-        self.ai_base_url_var.set(default_url)
+        current_url = self.ai_base_url_var.get().strip()
+        last_default = getattr(self, "_last_ai_default_url", None)
+        # Only overwrite Base URL when empty or still equal to the previous preset
+        # default — preserve user/custom/config URLs across provider switches.
+        if last_default is None or (not current_url) or current_url == last_default:
+            self.ai_base_url_var.set(default_url)
         self._last_ai_default_url = default_url
 
         self.ai_login_url_var.set(cfg.get("login_url", ""))

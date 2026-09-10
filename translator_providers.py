@@ -142,6 +142,73 @@ def chat_completions_url(base_url):
     return url + "/chat/completions"
 
 
+
+def reconcile_market_ai_route(provider_key, provider_cfg, base_url, label):
+    """Align provider_key/api_type/label to Base URL host when it is a known API.
+
+    UI selection can desync from a manually edited (or previously saved) Base URL
+    — e.g. Anthropic protocol + DeepSeek URL/key → DISABLED Anthropic auth, then
+    strict_paid backup falls through to GTX. When the URL host clearly belongs to
+    a known vendor, force the matching route even if the UI key disagrees.
+    Unknown / private / custom URLs are left unchanged.
+    """
+    cfg = dict(provider_cfg or {})
+    key = (provider_key or "").strip() or "custom"
+    resolved_label = (label or cfg.get("label") or key or "AI").strip() or "AI"
+    raw = (base_url or cfg.get("base_url") or "").strip()
+    if not raw:
+        return key, cfg, resolved_label
+
+    try:
+        host = (urlsplit(raw if "://" in raw else f"https://{raw}").hostname or "").lower()
+    except Exception:
+        host = ""
+    if not host:
+        return key, cfg, resolved_label
+
+    # (host needle, provider_key, api_type, label)
+    rules = (
+        ("api.anthropic.com", "anthropic", "anthropic", "Anthropic Claude"),
+        ("api.deepseek.com", "deepseek", "openai_compatible", "DeepSeek"),
+        ("api.openai.com", "openai", "openai_compatible", "OpenAI"),
+        ("api.moonshot.", "kimi", "openai_compatible", "Kimi / Moonshot"),
+        ("generativelanguage.googleapis.com", "gemini", "gemini", "Google Gemini"),
+        ("openrouter.ai", "openrouter", "openai_compatible", "OpenRouter"),
+        ("api.x.ai", "grok", "openai_compatible", "xAI Grok"),
+        ("api.groq.com", "groq", "openai_compatible", "Groq"),
+        ("api.mistral.ai", "mistral", "openai_compatible", "Mistral"),
+        ("dashscope.aliyuncs.com", "qwen", "openai_compatible", "Qwen / DashScope"),
+        ("dashscope-intl.aliyuncs.com", "qwen", "openai_compatible", "Qwen / DashScope"),
+        ("api.perplexity.ai", "perplexity", "openai_compatible", "Perplexity"),
+        ("api.together.xyz", "together", "openai_compatible", "Together AI"),
+        ("together.ai", "together", "openai_compatible", "Together AI"),
+        ("api.fireworks.ai", "fireworks", "openai_compatible", "Fireworks"),
+        ("api.xiaomimimo.com", "xiaomi_mimo", "openai_compatible", "Xiaomi MiMo"),
+    )
+    for needle, forced_key, api_type, forced_label in rules:
+        if needle in host:
+            cfg["api_type"] = api_type
+            cfg["label"] = forced_label
+            # Known vendor hosts always need a key for paid routing.
+            if "requires_key" in cfg:
+                cfg["requires_key"] = True
+            return forced_key, cfg, forced_label
+    return key, cfg, resolved_label
+
+
+def extract_openai_message_text(message):
+    """Prefer message.content; fall back to reasoning_content (DeepSeek reasoner-style)."""
+    if isinstance(message, dict):
+        content = extract_ai_text(message.get("content"))
+        if isinstance(content, str) and content.strip():
+            return content
+        reasoning = message.get("reasoning_content")
+        if reasoning:
+            return extract_ai_text(reasoning)
+        return content if isinstance(content, str) else ""
+    return extract_ai_text(message)
+
+
 def extract_ai_text(content):
     if isinstance(content, str):
         return content
@@ -257,6 +324,12 @@ def ai_chunk(session, chunk_data, post_url, req_headers, make_body,
             except Exception:
                 finish_reason = ""
             content = parse_resp(payload).strip()
+            if not content:
+                try:
+                    msg = payload.get("choices", [{}])[0].get("message") or {}
+                    content = extract_openai_message_text(msg).strip()
+                except Exception:
+                    content = content or ""
             if finish_reason.lower() in ("length", "max_tokens"):
                 return None, f"ERR:{eng_name} 模型輸出被截斷，請降低執行緒/批次或提高 max_tokens"
             trans_dict = _parse_translation_json(content, len(chunk_data))
@@ -611,7 +684,7 @@ def build_provider_registry(session, settings):
             {"Authorization": f"Bearer {openai_key}",
              "Content-Type": "application/json"},
             lambda d: make_chat_body(openai_model, d, 4096, "max_completion_tokens"),
-            lambda r: extract_ai_text(r['choices'][0]['message']['content']),
+            lambda r: extract_openai_message_text(r['choices'][0]['message']),
             "OpenAI",
             max_batch=model_batch_limit(openai_model, 40)
         )
@@ -626,7 +699,7 @@ def build_provider_registry(session, settings):
                                      "content": MC_PROMPT.format(
                                          json.dumps(d, ensure_ascii=False))}],
                        "temperature": 0.1, "max_tokens": 2048},
-            lambda r: extract_ai_text(r['choices'][0]['message']['content']),
+            lambda r: extract_openai_message_text(r['choices'][0]['message']),
             "LocalAI",
             max_batch=30
         )
@@ -903,7 +976,7 @@ def build_provider_registry(session, settings):
                 post_url,
                 headers,
                 lambda d: make_chat_body(ai_model, d, max_out, token_param, extra_body),
-                lambda r: extract_ai_text(r['choices'][0]['message']['content']),
+                lambda r: extract_openai_message_text(r['choices'][0]['message']),
                 ai_label,
                 request_timeout,
                 max_batch=model_batch_limit(ai_model, 40)
