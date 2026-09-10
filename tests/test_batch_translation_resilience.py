@@ -318,8 +318,8 @@ def test_backup_route_does_not_stampede_azure(monkeypatch):
     assert len(app.translation_cache) == 16
 
 
-def test_non_ai_chain_has_short_tail_wait_budget():
-    assert batch_module.translation_wait_budget("non_ai_chain", False) <= 60
+def test_non_ai_chain_has_failover_wait_budget():
+    assert batch_module.translation_wait_budget("non_ai_chain", False) == 180
     assert batch_module.translation_wait_budget("openai", True) == 300
 
 

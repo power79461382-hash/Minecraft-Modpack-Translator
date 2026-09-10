@@ -3461,7 +3461,7 @@ class ModTranslatorApp:
             "claude": "Claude API 建議 4~8（Token 計費，不宜過高）",
             "openai": "OpenAI API 建議 4~8（Token 計費，不宜過高）",
             "market_ai": "市面 AI 模型建議 3~6；OpenRouter/Groq/本地可依速率上限調整",
-            "non_ai_chain": "非 AI 翻譯鏈：僅 GTX（高速批次）；遇限流自動退避後重試",
+            "non_ai_chain": "非 AI 翻譯鏈：GTX 為主，限流自動切 MyMemory／LibreTranslate",
             "local":  "本地 AI 建議 2~4（受限於本機 GPU/CPU）",
         }
         self.workers_hint.config(text=hints.get(engine, ""))
