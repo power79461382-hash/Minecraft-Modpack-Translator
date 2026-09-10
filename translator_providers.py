@@ -49,10 +49,12 @@ GTX_MINECRAFT_GLOSSARY = {
 BING_BATCH_SIZE = 320
 AZURE_BATCH_SIZE = 100
 AZURE_BATCH_CHARS = 45_000
-GTX_GATE_INTERVAL = 0.05
-GTX_BATCH_SIZE = 128
-GTX_BATCH_CHARS = 9000
-GTX_SINGLETON_WORKERS = 12
+GTX_GATE_INTERVAL = 0.12
+GTX_BATCH_SIZE = 64
+GTX_BATCH_CHARS = 5000
+GTX_SINGLETON_WORKERS = 4
+GTX_GATE_MIN = 0.08
+GTX_GATE_MAX = 1.5
 
 
 def parse_retry_after_seconds(value, default=10.0, now=None):
@@ -476,17 +478,38 @@ def build_provider_registry(session, settings):
 
     gtx_lock = threading.Lock()
     gtx_last_req = [0.0]
-    gtx_interval = GTX_GATE_INTERVAL
+    # Mutable gate interval: slows on 429, recovers after healthy responses.
+    gtx_interval = [float(GTX_GATE_INTERVAL)]
+    gtx_success_streak = [0]
     gtx_worker_count = max(1, int(GTX_SINGLETON_WORKERS or 1))
     gtx_request_gate = threading.BoundedSemaphore(gtx_worker_count)
     gtx_singleton_executor = ThreadPoolExecutor(max_workers=gtx_worker_count)
+
+    def _gtx_on_rate_limit():
+        with gtx_lock:
+            gtx_success_streak[0] = 0
+            gtx_interval[0] = min(
+                float(GTX_GATE_MAX),
+                max(float(GTX_GATE_MIN), gtx_interval[0] * 2.0),
+            )
+            return gtx_interval[0]
+
+    def _gtx_on_success():
+        with gtx_lock:
+            gtx_success_streak[0] += 1
+            if gtx_success_streak[0] >= 8 and gtx_interval[0] > float(GTX_GATE_MIN):
+                gtx_interval[0] = max(
+                    float(GTX_GATE_MIN),
+                    gtx_interval[0] * 0.85,
+                )
+                gtx_success_streak[0] = 0
 
     def gtx_gate():
         # 鎖內只「預約」下一個發射時間槽，sleep 移到鎖外，
         # 避免多個 worker 全部卡在同一把鎖上序列化等待
         with gtx_lock:
             now = time.time()
-            slot = max(now, gtx_last_req[0] + gtx_interval)
+            slot = max(now, gtx_last_req[0] + gtx_interval[0])
             gtx_last_req[0] = slot
         gap = slot - time.time()
         if gap > 0:
@@ -526,11 +549,14 @@ def build_provider_registry(session, settings):
                     f"[[MCT{idx:03d}]] {value}" for idx, value in enumerate(batch))
                 res = _gtx_request(params_fn, payload, (5, 15))
                 if res.status_code == 429:
-                    return None, "429:30"
+                    interval = _gtx_on_rate_limit()
+                    # Short cooldown so MyMemory/other backups (or GTX retry) resume sooner.
+                    return None, f"429:{max(15, int(interval * 20))}"
                 if res.status_code == 200:
                     raw = html.unescape("".join(p[0] for p in res.json()[0] if p[0]))
                     parts = parse_gtx_numbered_batch(raw, len(batch))
                     if parts:
+                        _gtx_on_success()
                         return [apply_gtx_glossary(src, dst)
                                 for src, dst in zip(batch, parts)], None
                 elif res.status_code not in (413, 414):
@@ -560,10 +586,12 @@ def build_provider_registry(session, settings):
 
             res = _gtx_request(params_fn, batch[0], (5, 12))
             if res.status_code == 429:
-                return None, "429:30"
+                interval = _gtx_on_rate_limit()
+                return None, f"429:{max(15, int(interval * 20))}"
             if res.status_code == 200:
                 text = html.unescape("".join(p[0] for p in res.json()[0] if p[0]))
                 translated = text.strip() or None
+                _gtx_on_success()
                 return [apply_gtx_glossary(batch[0], translated)], None
             return None, f"ERR:GTX HTTP {res.status_code}"
         except requests.RequestException as e:

@@ -22,8 +22,8 @@ def translation_worker_limit(max_workers, primary_id, engine):
     if primary_id == 'bing':
         return min(max_workers, 4)
     if primary_id == 'gtx':
-        # GTX high throughput; gate + 429 cooldown pace requests
-        return min(max_workers, 16)
+        # GTX free endpoint: keep concurrency moderate; adaptive gate handles 429.
+        return min(max_workers, 6)
     if primary_id == 'azure':
         return min(max_workers, 5)
     if primary_id in ('mymemory', 'libretranslate'):
@@ -40,7 +40,7 @@ def engine_concurrency_limit(max_workers, engine_id):
     if engine_id == 'azure':
         return min(max_workers, 5)
     if engine_id == 'gtx':
-        return min(max_workers, 16)
+        return min(max_workers, 6)
     if engine_id == 'bing':
         return min(max_workers, 4)
     return max_workers
@@ -49,8 +49,8 @@ def engine_concurrency_limit(max_workers, engine_id):
 def translation_wait_budget(engine_route, strict_paid_primary):
     """Return the per-chunk cumulative cooldown budget in seconds."""
     if engine_route == 'non_ai_chain' and not strict_paid_primary:
-        # Allow GTX cooldown + MyMemory/LibreTranslate failover before skip.
-        return 180
+        # Allow GTX adaptive cooldown + MyMemory failover before skip.
+        return 240
     return 300
 
 
@@ -58,19 +58,20 @@ def translation_fallback_order(engine, primary_id, ai_provider_key=None,
                                azure_available=None):
     """Return fallback route order after the selected primary engine.
 
-    Free machine-translation channels keep GTX only. Bing free auth is dead;
-    MyMemory / LibreTranslate are removed from free routing.
+    Primary free path is GTX. MyMemory is kept as a 429 failover only
+    (Bing free auth is dead; public LibreTranslate usually needs a key).
     """
     if primary_id == "market_ai" and ai_provider_key in (
             "deepseek_v4_flash_free", "openrouter_free_router", "openrouter_free_models", "openrouter"):
-        order = ['gtx']
+        order = ['gtx', 'mymemory']
     elif engine == "non_ai_chain":
-        order = ['gtx']
+        order = ['gtx', 'mymemory']
     elif engine != "non_ai_chain" and primary_id in (
             "market_ai", "openai", "claude", "google_api", "azure", "deepl"):
-        order = ['gtx']
+        # Paid primary already has its own strict backup policy; GTX remains last resort.
+        order = ['gtx', 'mymemory']
     else:
-        order = ['gtx']
+        order = ['gtx', 'mymemory']
     if azure_available is False:
         order = [engine_id for engine_id in order if engine_id != 'azure']
     return order
@@ -92,9 +93,14 @@ def engine_rate_limit_cooldown(engine_route, engine_id, retry_after):
             "deepl": 60.0,
             "azure": 90.0,
             "bing": 60.0,
-            "gtx": 90.0,
+            # Keep GTX cooldown short so MyMemory can run (or GTX retry) instead of 90s idle.
+            "gtx": 20.0,
+            "mymemory": 45.0,
         }
         seconds = max(seconds, minimums.get(engine_id, seconds))
+    elif engine_id == "gtx":
+        # Paid-route GTX backup also should not sit out for 90s.
+        seconds = max(seconds, 20.0)
     return max(1.0, seconds)
 
 
