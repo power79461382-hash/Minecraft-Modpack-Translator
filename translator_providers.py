@@ -252,7 +252,8 @@ def model_batch_limit(model_name, default=20):
     if any(k in model for k in ("gpt-5", "gpt-4", "o4", "o3")):
         return 50
     if any(k in model for k in ("deepseek", "kimi", "moonshot", "grok", "qwen")):
-        return 40
+        # Smaller batches avoid output max_tokens truncation on long Minecraft strings.
+        return 16
     return default
 
 
@@ -312,6 +313,23 @@ def ai_chunk(session, chunk_data, post_url, req_headers, make_body,
             results.extend(sub_res)
         return results, None
 
+    def _split_and_retry(reason):
+        """On truncation / incomplete JSON, halve the batch instead of failing the wave."""
+        if len(chunk_data) <= 1:
+            return None, reason
+        mid = max(1, len(chunk_data) // 2)
+        left, err = ai_chunk(session, chunk_data[:mid], post_url, req_headers,
+                             make_body, parse_resp, eng_name,
+                             request_timeout, max_batch)
+        if err:
+            return None, err
+        right, err = ai_chunk(session, chunk_data[mid:], post_url, req_headers,
+                              make_body, parse_resp, eng_name,
+                              request_timeout, max_batch)
+        if err:
+            return None, err
+        return left + right, None
+
     chunk_dict = {str(i): t for i, t in enumerate(chunk_data)}
     try:
         res = session.post(post_url, headers=req_headers,
@@ -331,8 +349,20 @@ def ai_chunk(session, chunk_data, post_url, req_headers, make_body,
                 except Exception:
                     content = content or ""
             if finish_reason.lower() in ("length", "max_tokens"):
-                return None, f"ERR:{eng_name} 模型輸出被截斷，請降低執行緒/批次或提高 max_tokens"
-            trans_dict = _parse_translation_json(content, len(chunk_data))
+                return _split_and_retry(
+                    f"ERR:{eng_name} 模型輸出被截斷，請降低執行緒/批次或提高 max_tokens")
+            try:
+                trans_dict = _parse_translation_json(content, len(chunk_data))
+            except (json.JSONDecodeError, TypeError) as parse_err:
+                detail = str(parse_err)
+                if len(chunk_data) > 1 and any(
+                        kw in detail for kw in (
+                            "Unterminated string", "Expecting value",
+                            "no JSON object", "missing expected translation key",
+                            "empty model content")):
+                    return _split_and_retry(
+                        f"ERR:{eng_name} JSON 解析失敗: {detail}")
+                raise
             return [trans_dict[str(i)]
                     for i in range(len(chunk_data))], None
         if res.status_code == 429:
@@ -961,7 +991,7 @@ def build_provider_registry(session, settings):
         post_url = chat_completions_url(ai_base_url)
         token_param = ai_provider_cfg.get("token_param", "max_tokens")
         extra_body = dict(ai_provider_cfg.get("extra_body", {}) or {})
-        max_out = 8192 if ai_provider_key == "deepseek" else 4096
+        max_out = 16384 if ai_provider_key == "deepseek" else 4096
         if ai_provider_key == "deepseek":
             extra_body.setdefault("response_format", {"type": "json_object"})
         for _ in range(max(1, len(ai_api_keys))):
