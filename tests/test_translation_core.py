@@ -858,10 +858,10 @@ class AnalysisScanFilterTests(unittest.TestCase):
 
 
 class AdaptiveConcurrencyTests(unittest.TestCase):
-    def test_non_ai_fallback_order_prefers_gtx_with_free_backups(self):
+    def test_non_ai_fallback_order_is_gtx_only(self):
         self.assertEqual(
             translation_fallback_order("non_ai_chain", "gtx"),
-            ["gtx", "mymemory", "libretranslate"],
+            ["gtx"],
         )
 
     def test_engine_selection_uses_priority_and_skips_throttled_engine(self):
@@ -887,7 +887,7 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
         self.assertEqual(
             translation_fallback_order(
                 "market_ai", "market_ai", "deepseek_v4_flash_free"),
-            ["gtx", "mymemory", "libretranslate", "google_api"],
+            ["gtx"],
         )
 
     def test_non_ai_timeout_fails_over_instead_of_splitting(self):

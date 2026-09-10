@@ -57,20 +57,19 @@ def translation_fallback_order(engine, primary_id, ai_provider_key=None,
                                azure_available=None):
     """Return fallback route order after the selected primary engine.
 
-    Bing 免費 auth 端點已 404 失效；Azure 在高並發下易 429。
-    非 AI 鏈以 GTX 為主，MyMemory / LibreTranslate 作為 429 備援，
-    避免單一引擎限流後整批略過。
+    Free machine-translation channels keep GTX only. Bing free auth is dead;
+    MyMemory / LibreTranslate are removed from free routing.
     """
     if primary_id == "market_ai" and ai_provider_key in (
             "deepseek_v4_flash_free", "openrouter_free_router", "openrouter_free_models", "openrouter"):
-        order = ['gtx', 'mymemory', 'libretranslate', 'google_api']
+        order = ['gtx']
     elif engine == "non_ai_chain":
-        order = ['gtx', 'mymemory', 'libretranslate']
+        order = ['gtx']
     elif engine != "non_ai_chain" and primary_id in (
             "market_ai", "openai", "claude", "google_api", "azure", "deepl"):
-        order = ['gtx', 'mymemory', 'libretranslate']
+        order = ['gtx']
     else:
-        order = ['gtx', 'mymemory', 'libretranslate', 'google_api']
+        order = ['gtx']
     if azure_available is False:
         order = [engine_id for engine_id in order if engine_id != 'azure']
     return order
@@ -93,8 +92,6 @@ def engine_rate_limit_cooldown(engine_route, engine_id, retry_after):
             "azure": 90.0,
             "bing": 60.0,
             "gtx": 90.0,
-            "mymemory": 20.0,
-            "libretranslate": 20.0,
         }
         seconds = max(seconds, minimums.get(engine_id, seconds))
     return max(1.0, seconds)

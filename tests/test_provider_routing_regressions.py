@@ -261,9 +261,9 @@ def test_retry_after_supports_seconds_http_date_and_invalid_values():
     assert providers.parse_retry_after_seconds("not-a-date", default=10, now=now) == 10.0
 
 
-def test_non_ai_fallback_order_prefers_gtx_with_free_backups():
+def test_non_ai_fallback_order_is_gtx_only():
     assert batch_module.translation_fallback_order(
         "non_ai_chain",
         "gtx",
         azure_available=False,
-    ) == ["gtx", "mymemory", "libretranslate"]
+    ) == ["gtx"]
