@@ -5,7 +5,10 @@ import time
 import tkinter as tk
 import zipfile
 
-from core.analysis_scan import java_runtime_warning_lines
+from core.analysis_scan import (
+    apply_pcl_java_runtime_select,
+    java_runtime_warning_lines,
+)
 from core.jar_patcher import atomic_zip_output_group
 from translation_cache import cache_snapshot
 from translation_packager import (
@@ -32,32 +35,42 @@ POST_TRANSLATION_RESCUE_LIMIT = 500
 
 
 def confirm_java_runtime_before_translation(app):
-    """Require explicit confirmation after an incompatible launcher runtime."""
+    """Auto-switch PCL to the recommended Java runtime; never prompt."""
     report = getattr(app, '_java_runtime_compatibility_report', None)
     if not isinstance(report, dict) or not report.get('is_incompatible'):
         return True
 
-    warning_lines = [
-        line.strip() for line in java_runtime_warning_lines(report)
-        if line.strip()
-    ]
-    warning_lines.extend((
-        "",
-        "請先到 PCL 的此版本設定，將 Java 改為上列 Java 17。",
-        "完成設定後才按「是」；按「否」會取消本次翻譯輸出。",
-    ))
-    ask = getattr(app, '_ask_proceed_from_thread', None)
-    if not callable(ask):
-        app.log("⛔ Java 版本不相容且無法取得確認，已取消翻譯。")
-        return False
-    confirmed = bool(ask(
-        "Java 版本錯誤：先切換至 Java 17",
-        '\n'.join(warning_lines)))
-    if confirmed:
-        app.log("✅ 已確認啟動器改用 Java 17，繼續翻譯。")
-    else:
-        app.log("⛔ 尚未確認切換 Java 17，已取消本次翻譯。")
-    return confirmed
+    required_java = report.get('required_java_major') or 17
+    java_path = report.get('recommended_java_path')
+    instance_dir = (
+        report.get('instance_dir')
+        or getattr(app, 'analyzed_mc_dir', None)
+    )
+
+    if java_path and instance_dir:
+        ok, detail = apply_pcl_java_runtime_select(
+            instance_dir, java_path, major=required_java)
+        if ok:
+            app.log(
+                f"✅ 已自動將 PCL 此版本切換為 Java {required_java}："
+                f"{java_path}")
+            app.log(f"   設定檔：{detail}")
+            report['auto_switched_java'] = True
+            report['auto_switch_ini'] = detail
+            return True
+        app.log(
+            f"⚠️ 無法自動寫入 PCL Java 設定（{detail}）；"
+            f"仍繼續翻譯，請稍後在啟動器確認 Java {required_java}。")
+        report['auto_switched_java'] = False
+        report['auto_switch_error'] = detail
+        return True
+
+    app.log(
+        f"⚠️ Java 版本不相容且找不到本機 Java {required_java}，"
+        "無法自動切換；仍繼續翻譯。")
+    report['auto_switched_java'] = False
+    report['auto_switch_error'] = 'no_recommended_java_path'
+    return True
 
 
 def save_post_batch_checkpoint(app):

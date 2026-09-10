@@ -94,7 +94,7 @@ def test_incompatible_java_report_is_embedded_in_client_package(tmp_path):
     assert "Java 25" in warning
     assert "Java 17" in warning
     assert "不是翻譯包或 Paxi 錯誤" in warning
-    assert "翻譯器不會修改 Java 或遊戲實例" in warning
+    assert "會自動把 PCL 此版本" in warning
 
 
 @pytest.mark.parametrize("runtime_report", [None, {"status": "compatible"}])
