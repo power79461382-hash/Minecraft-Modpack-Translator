@@ -646,25 +646,8 @@ class ModTranslatorApp:
             "hint": "OpenRouter 可用同一組 API Key 路由多家模型；也可手動輸入任意模型 id。",
             "requires_key": True,
         },
-        "libretranslate": {
-            "label": "LibreTranslate 本機/自架",
-            "api_type": "libretranslate",
-            "base_url": "http://127.0.0.1:5000",
-            "models": ("en→zh",),
-            "login_url": "https://github.com/LibreTranslate/LibreTranslate",
-            "hint": "免費開源翻譯 API；可自架於本機。預設呼叫 http://127.0.0.1:5000/translate，不需要雲端 API Key。",
-            "requires_key": False,
-        },
-        "bing_free": {
-            "label": "Bing 免費翻譯（免 API）",
-            "api_type": "bing",
-            "base_url": "https://www.bing.com",
-            "models": ("en→zh-Hant",),
-            "login_url": "",
-            "hint": "微軟 Bing 網頁翻譯端點：免 API Key、免本地模型、原生支援繁體中文。"
-                    "品質優於 GTX，適合沒有任何 Key 時直接使用；大量翻譯可能被暫時限流。",
-            "requires_key": False,
-        },
+
+
         "cohere": {
             "label": "Cohere",
             "api_type": "openai_compatible",
@@ -1856,7 +1839,7 @@ class ModTranslatorApp:
             "claude": "Claude",
             "openai": "OpenAI",
             "local": "本地 AI",
-            "non_ai_chain": "非 AI 翻譯鏈",
+            "non_ai_chain": "非 AI 翻譯鏈：僅用 GTX（其他免費通道已移除）",
         }
         label = engine_names.get(engine, engine or "--")
         return "已設定", f"引擎：{label}", self.C_SUCCESS
@@ -2741,8 +2724,6 @@ class ModTranslatorApp:
             "openrouter_free_models",
             "gemini",
             "groq",
-            "libretranslate",
-            "bing_free",
             "custom",
         }
         return "free" if key in free_keys else "paid"
@@ -3461,7 +3442,7 @@ class ModTranslatorApp:
             "claude": "Claude API 建議 4~8（Token 計費，不宜過高）",
             "openai": "OpenAI API 建議 4~8（Token 計費，不宜過高）",
             "market_ai": "市面 AI 模型建議 3~6；OpenRouter/Groq/本地可依速率上限調整",
-            "non_ai_chain": "非 AI 翻譯鏈：GTX 為主，限流自動切 MyMemory／LibreTranslate",
+            "non_ai_chain": "非 AI 翻譯鏈：僅用 GTX（其他免費通道已移除）",
             "local":  "本地 AI 建議 2~4（受限於本機 GPU/CPU）",
         }
         self.workers_hint.config(text=hints.get(engine, ""))
