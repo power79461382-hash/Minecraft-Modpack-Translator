@@ -269,8 +269,8 @@ class ProviderHelperTests(unittest.TestCase):
         )
 
     def test_gtx_gate_uses_fast_fallback_interval(self):
-        self.assertGreaterEqual(GTX_GATE_INTERVAL, 0.8)
-        self.assertLessEqual(GTX_BATCH_SIZE, 24)
+        self.assertLessEqual(GTX_GATE_INTERVAL, 0.1)
+        self.assertGreaterEqual(GTX_BATCH_SIZE, 64)
 
     def test_gtx_numbered_batch_parser_keeps_every_item(self):
         raw = "[[MCT000]] 救贖之戒\n[[ MCT001 ]] 護甲穿透\n[[MCT002]] 冰霜傷害"
@@ -930,9 +930,9 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
     def test_translation_worker_limit_caps_bing_large_batch_burst(self):
         self.assertEqual(translation_worker_limit(16, "bing", "non_ai_chain"), 4)
         self.assertEqual(translation_worker_limit(32, "bing", "non_ai_chain"), 4)
-        self.assertEqual(translation_worker_limit(16, "gtx", "non_ai_chain"), 1)
+        self.assertEqual(translation_worker_limit(16, "gtx", "non_ai_chain"), 16)
         self.assertEqual(translation_worker_limit(16, "mymemory", "non_ai_chain"), 4)
-        self.assertEqual(translation_worker_limit(16, "deepseek", "market_ai"), 8)
+        self.assertEqual(translation_worker_limit(16, "deepseek", "market_ai"), 16)
 
     def test_rate_limit_halves_and_success_recovers(self):
         limiter = AdaptiveConcurrency(8, minimum=1, maximum=8)
