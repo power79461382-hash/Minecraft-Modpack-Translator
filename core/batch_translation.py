@@ -9,7 +9,7 @@ from collections import deque
 import requests
 
 from core.adaptive_concurrency import AdaptiveConcurrency
-from translator_providers import build_provider_registry, normalize_base_url
+from translator_providers import build_provider_registry, normalize_base_url, reconcile_market_ai_route
 
 
 def translation_worker_limit(max_workers, primary_id, engine):
@@ -253,6 +253,18 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
             # tkinter 變數只能在主執行緒寫入（此處跑在翻譯 worker 上）
             self.root.after(0, lambda u=normalized_url: self.ai_base_url_var.set(u))
             self.log(f"INFO  Base URL 已自動整理：{normalized_url}")
+
+    _route_before = (ai_provider_key, (ai_provider_cfg or {}).get("api_type"), ai_label)
+    ai_provider_key, ai_provider_cfg, ai_label = reconcile_market_ai_route(
+        ai_provider_key, ai_provider_cfg, ai_base_url, ai_label)
+    _route_after = (ai_provider_key, (ai_provider_cfg or {}).get("api_type"), ai_label)
+    if engine == "market_ai":
+        self.log(f"INFO  市面AI：{ai_label} / {ai_model} @ {ai_base_url or '(no base url)'}")
+        if _route_before != _route_after:
+            self.log(
+                f"WARN  Base URL 與供應商已自動對齊：{_route_before[0]}/{_route_before[1]} "
+                f"→ {ai_provider_key}/{(ai_provider_cfg or {}).get('api_type')}（{ai_label}）")
+
     market_ai_blocked = False
 
     # ── 驗證主引擎必要設定 ──
@@ -342,7 +354,7 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
     free_market_ai = (
         primary_id in ("market_ai", "bing")
         and (
-            ai_provider_key in ("deepseek_v4_flash_free", "openrouter_free_router", "openrouter_free_models", "libretranslate", "bing_free", "custom")
+            ai_provider_key in ("deepseek_v4_flash_free", "openrouter_free_router", "openrouter_free_models", "libretranslate", "bing_free")
             or ai_model.lower() == "openrouter/free"
             or ai_model.lower().endswith(":free")
             or not ai_provider_cfg.get("requires_key", True)
