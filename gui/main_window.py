@@ -694,6 +694,15 @@ class ModTranslatorApp:
             "hint": "Cerebras Inference，高速 OpenAI-compatible API；部分舊模型如 llama3.1-8b、qwen-3-235b-a22b-instruct-2507 已有淘汰日期，建議優先用 GPT-OSS / Llama 3.3 / Qwen 新項目。",
             "requires_key": True,
         },
+        "libretranslate": {
+            "label": "LibreTranslate（本機）",
+            "api_type": "libretranslate",
+            "base_url": "http://127.0.0.1:5000",
+            "models": ("libretranslate-local",),
+            "login_url": "https://github.com/LibreTranslate/LibreTranslate",
+            "hint": "請先本機啟動 LibreTranslate（預設 http://127.0.0.1:5000）。免 Key；若實例有設 Key 再填。Docker: docker run -d -p 5000:5000 libretranslate/libretranslate",
+            "requires_key": False,
+        },
         "custom": {
             "label": "本地/自訂 OpenAI-compatible",
             "api_type": "openai_compatible",
@@ -1149,7 +1158,7 @@ class ModTranslatorApp:
                       font=("微軟正黑體", 15),
                       relief="flat", bd=0, cursor="hand2",
                       width=3).pack(side=tk.LEFT, padx=(0, 10))
-        tk.Label(sidebar, text="v1.2.11", bg=panel2, fg=muted,
+        tk.Label(sidebar, text="v1.2.12", bg=panel2, fg=muted,
                  font=("Consolas", 9), anchor="w").pack(
                      side=tk.BOTTOM, fill=tk.X, padx=22, pady=(0, 10))
 
@@ -2365,7 +2374,7 @@ class ModTranslatorApp:
     def show_about(self):
         msg = (
             "Minecraft 模組翻譯器\n"
-            "版本：v1.2.11\n"
+            "版本：v1.2.12\n"
             "預設模型：DeepSeek V4 Flash Free (OpenRouter)\n"
             "支援：JAR 直接翻譯、自動判定、全域記憶池與多 API 模型"
         )
@@ -2721,6 +2730,7 @@ class ModTranslatorApp:
     @classmethod
     def _ai_provider_menu_for_key(cls, key):
         free_keys = {
+            "libretranslate",
             "deepseek_v4_flash_free",
             "openrouter_free_router",
             "openrouter_free_models",

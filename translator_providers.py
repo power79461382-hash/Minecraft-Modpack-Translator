@@ -256,6 +256,8 @@ def model_batch_limit(model_name, default=20):
     if any(k in model for k in ("deepseek", "kimi", "moonshot", "grok", "qwen")):
         # Smaller batches avoid output max_tokens truncation on long Minecraft strings.
         return 16
+    if "libretranslate" in model:
+        return 32
     return default
 
 
@@ -763,41 +765,157 @@ def build_provider_registry(session, settings):
         )
 
     def libretranslate(chunk_data):
+        """Local/self-hosted LibreTranslate. Prefer batch /translate for speed."""
         base = (ai_base_url or "http://127.0.0.1:5000").rstrip("/")
         url = base if base.endswith("/translate") else base + "/translate"
-        results = []
-        for text in chunk_data:
-            if should_stop():
-                results.extend([None] * (len(chunk_data) - len(results)))
-                break
-            payload = {
-                "q": text,
-                "source": "auto",
-                "target": "zh",
-                "format": "text",
-            }
-            if ai_api_key:
-                payload["api_key"] = ai_api_key
+        texts = list(chunk_data)
+        if not texts:
+            return [], None
+        if should_stop():
+            return [None] * len(texts), None
+
+        # Prefer Traditional when the instance supports it; else zh + optional OpenCC.
+        target = "zh"
+        try:
+            lang_url = base[:-len("/translate")] if base.endswith("/translate") else base
+            lang_url = lang_url.rstrip("/") + "/languages"
+            lr = http_session().get(lang_url, timeout=(2, 5))
+            if lr.status_code == 200:
+                codes = {str(item.get("code", "")).lower() for item in (lr.json() or []) if isinstance(item, dict)}
+                for cand in ("zh-Hant", "zh_Hant", "zt", "zh-TW", "zh_tw"):
+                    if cand.lower() in codes:
+                        target = cand
+                        break
+                else:
+                    if "zh" in codes:
+                        target = "zh"
+        except Exception:
+            pass
+
+        payload = {
+            "q": texts if len(texts) > 1 else texts[0],
+            "source": "auto",
+            "target": target,
+            "format": "text",
+        }
+        if ai_api_key:
+            payload["api_key"] = ai_api_key
+
+        def _opencc_list(rows):
             try:
-                res = http_session().post(url, json=payload, timeout=(5, 30))
-                if res.status_code == 200:
-                    data = res.json()
-                    translated = data.get("translatedText")
-                    if isinstance(translated, list):
-                        translated = translated[0] if translated else None
-                    results.append(str(translated).strip() if translated else None)
+                from opencc import OpenCC
+                cc = OpenCC("s2twp")
+                out = []
+                for item in rows:
+                    if item is None:
+                        out.append(None)
+                    else:
+                        s = str(item).strip()
+                        out.append(cc.convert(s) if s else None)
+                return out
+            except Exception:
+                return [str(x).strip() if x is not None else None for x in rows]
+
+        need_opencc = target.lower() in ("zh", "zh-cn", "zh_cn", "zh-hans", "zh_hans")
+
+        try:
+            res = http_session().post(url, json=payload, timeout=(5, 120))
+        except Exception as e:
+            msg = str(e)
+            low = msg.lower()
+            if any(x in low for x in ("connection refused", "failed to establish", "max retries", "name or service", "nodename", "actively refused")):
+                return None, "DISABLED:LibreTranslate 連不上本機服務，請先啟動 http://127.0.0.1:5000"
+            return None, f"DISABLED:LibreTranslate 連線失敗: {e}"
+
+        if res.status_code == 200:
+            data = res.json() if res.content else {}
+            translated = data.get("translatedText")
+            if isinstance(translated, list):
+                rows = [str(x).strip() if x is not None else None for x in translated]
+                if len(rows) != len(texts):
+                    # fall back to per-item if batch length mismatch
+                    rows = []
+                    for text in texts:
+                        if should_stop():
+                            rows.extend([None] * (len(texts) - len(rows)))
+                            break
+                        one = {"q": text, "source": "auto", "target": target, "format": "text"}
+                        if ai_api_key:
+                            one["api_key"] = ai_api_key
+                        r2 = http_session().post(url, json=one, timeout=(5, 60))
+                        if r2.status_code != 200:
+                            rows.append(None)
+                            continue
+                        t = (r2.json() or {}).get("translatedText")
+                        if isinstance(t, list):
+                            t = t[0] if t else None
+                        rows.append(str(t).strip() if t else None)
+                return (_opencc_list(rows) if need_opencc else rows), None
+            if translated is None and isinstance(data, list):
+                # some forks return list of objects
+                rows = []
+                for item in data:
+                    if isinstance(item, dict):
+                        t = item.get("translatedText")
+                        rows.append(str(t).strip() if t else None)
+                    else:
+                        rows.append(str(item).strip() if item else None)
+                if len(rows) == len(texts):
+                    return (_opencc_list(rows) if need_opencc else rows), None
+            row = str(translated).strip() if translated else None
+            if len(texts) == 1:
+                return (_opencc_list([row]) if need_opencc else [row]), None
+            # single string for multi: retry one-by-one
+            rows = []
+            for text in texts:
+                if should_stop():
+                    rows.extend([None] * (len(texts) - len(rows)))
+                    break
+                one = {"q": text, "source": "auto", "target": target, "format": "text"}
+                if ai_api_key:
+                    one["api_key"] = ai_api_key
+                r2 = http_session().post(url, json=one, timeout=(5, 60))
+                if r2.status_code != 200:
+                    rows.append(None)
                     continue
-                if res.status_code == 429:
-                    results.extend([None] * (len(chunk_data) - len(results)))
-                    return results, "429:30"
-                if res.status_code in (401, 403):
-                    return None, "DISABLED:LibreTranslate API Key 無效或無授權"
-                return None, f"DISABLED:LibreTranslate HTTP {res.status_code}"
-            except requests.RequestException as e:
-                return None, f"DISABLED:LibreTranslate 連線失敗: {e}"
-            except (ValueError, TypeError, KeyError) as e:
-                return None, f"ERR:LibreTranslate 回應解析失敗: {e}"
-        return results, None
+                t = (r2.json() or {}).get("translatedText")
+                if isinstance(t, list):
+                    t = t[0] if t else None
+                rows.append(str(t).strip() if t else None)
+            return (_opencc_list(rows) if need_opencc else rows), None
+
+        if res.status_code == 429:
+            return None, "429:20"
+        if res.status_code in (401, 403):
+            if ai_api_key:
+                return None, "DISABLED:LibreTranslate API Key 無效或無權限"
+            return None, "DISABLED:LibreTranslate 需要 API Key（本機若未設 Key 請清空金鑰欄）"
+        if res.status_code == 400:
+            # batch may be unsupported — fall back to sequential
+            rows = []
+            for text in texts:
+                if should_stop():
+                    rows.extend([None] * (len(texts) - len(rows)))
+                    break
+                one = {"q": text, "source": "auto", "target": target, "format": "text"}
+                if ai_api_key:
+                    one["api_key"] = ai_api_key
+                try:
+                    r2 = http_session().post(url, json=one, timeout=(5, 60))
+                    if r2.status_code == 200:
+                        t = (r2.json() or {}).get("translatedText")
+                        if isinstance(t, list):
+                            t = t[0] if t else None
+                        rows.append(str(t).strip() if t else None)
+                    else:
+                        rows.append(None)
+                except Exception:
+                    rows.append(None)
+            if any(rows):
+                return (_opencc_list(rows) if need_opencc else rows), None
+            return None, f"DISABLED:LibreTranslate HTTP {res.status_code}"
+        return None, f"DISABLED:LibreTranslate HTTP {res.status_code}"
+
 
     def mymemory(chunk_data):
         results = []
