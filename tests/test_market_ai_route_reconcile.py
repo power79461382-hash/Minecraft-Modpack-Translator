@@ -60,7 +60,7 @@ def test_reconcile_unknown_url_unchanged():
     assert label == "自訂 OpenAI Compatible"
 
 
-def test_paid_market_ai_fallback_is_gtx_only():
+def test_paid_market_ai_fallback_is_gtx_with_mymemory():
     assert translation_fallback_order(
         "market_ai", "market_ai", "deepseek") == ["gtx"]
     assert translation_fallback_order(
@@ -69,7 +69,7 @@ def test_paid_market_ai_fallback_is_gtx_only():
         "market_ai", "market_ai", "openai") == ["gtx"]
 
 
-def test_free_market_ai_keys_still_gtx_only_fallback():
+def test_free_market_ai_keys_still_gtx_with_mymemory_fallback():
     assert translation_fallback_order(
         "market_ai", "market_ai", "deepseek_v4_flash_free") == ["gtx"]
     assert translation_fallback_order(
