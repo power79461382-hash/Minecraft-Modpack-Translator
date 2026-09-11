@@ -5,7 +5,11 @@ Minecraft Modpack Translator 是一個面向 Minecraft 大型整合包的 Window
 本專案的目標不是只翻譯單一 `en_us.json`，而是盡可能處理整合包常見的多來源文字：模組語言檔、Patchouli 手冊、FTB Quests / KubeJS 任務、advancement、OpenLoader / Paxi 覆蓋資料、Origins JSON、Alex's Mobs 類型書本、Markdown / SNBT / 部分設定文字，以及低風險硬編碼 tooltip。
 
 
-## v1.2.12
+
+## v1.2.13
+- LibreTranslate **一鍵啟動／關閉本機服務**（介面按鈕）
+- 優先 Docker 容器 `mc-libretranslate`；無 Docker 時可自動 `pip install libretranslate` 並以本機行程啟動
+## v1.2.13
 - 新增 **LibreTranslate（本機）** 免費供應商選項（預設 `http://127.0.0.1:5000`）
 - 本機 LibreTranslate 支援批次 `/translate`、高併發（最多 16），並在僅有簡中時自動 OpenCC 轉繁
 - 啟動方式範例：`docker run -d -p 5000:5000 libretranslate/libretranslate`
@@ -13,9 +17,9 @@ Minecraft Modpack Translator 是一個面向 Minecraft 大型整合包的 Window
 
 一般使用者不需要安裝 Python。請到 GitHub Releases 下載最新版：
 
-- 目前最新版：**v1.2.12**（2026-09-10）
+- 目前最新版：**v1.2.13**（2026-09-10）
 - 下載頁：[Releases / 最新版](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/latest)
-- 直接下載：[MinecraftTranslatorGUI.exe（v1.2.6）](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/download/v1.2.12/MinecraftTranslatorGUI.exe)
+- 直接下載：[MinecraftTranslatorGUI.exe（v1.2.6）](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/download/v1.2.13/MinecraftTranslatorGUI.exe)
 - 檔案名稱：`MinecraftTranslatorGUI.exe`
 - 系統需求：Windows 10/11，建議放在可寫入的資料夾中執行
 - 使用方式：下載後直接雙擊啟動，選擇整合包資料夾，按「分析檔案」後再開始翻譯
@@ -201,27 +205,27 @@ tests/test_cache_polish.py       快取載入時格式碼／佔位符自動修�
 
 目前工具已能處理大型整合包的主要翻譯來源，並已針對常見崩潰原因加上防護：空 `zh_tw` 輸出、FTB Quests type 被翻譯、Patchouli 巨集破壞、Unicode surrogate、已簽名 JAR 與高風險啟動 JAR。
 
-### 2026-09-10 v1.2.12 GTX adaptive rate + MyMemory failover
+### 2026-09-10 v1.2.13 GTX adaptive rate + MyMemory failover
 
 - GTX starts moderate and auto-slows gate on 429, recovers after success
 - GTX cooldown 90s→~20s; MyMemory restored as free failover
 - GTX worker cap 16→6 to reduce burst 429s
 
-### 2026-09-10 v1.2.12 DeepSeek truncation auto-split
+### 2026-09-10 v1.2.13 DeepSeek truncation auto-split
 
 - DeepSeek/Kimi/Qwen batch 40→16; DeepSeek max_tokens 8192→16384
 - On output truncation / incomplete JSON, auto-split batch in half and retry
 
-### 2026-09-10 v1.2.12 Restore GTX high throughput
+### 2026-09-10 v1.2.13 Restore GTX high throughput
 
 - Restore GTX fast profile (gate 0.05 / batch 128x9000 / singleton workers 12)
 - Worker cap back to 16 (no longer locked to 1)
 - Keep HTTP 429 cooldown/backoff
 
-### 2026-09-10 v1.2.12 付費市面 AI 路由對齊
+### 2026-09-10 v1.2.13 付費市面 AI 路由對齊
 - Base URL 與供應商/api_type 自動對齊，避免 Anthropic 協議打到 DeepSeek 端點後 DISABLED 再落到 GTX。
 - 切換供應商時不再無條件覆寫已自訂的 Base URL。
-- DeepSeek / OpenAI-compatible 支援 `reasoning_content` 回填；UI 版號改為 v1.2.12。
+- DeepSeek / OpenAI-compatible 支援 `reasoning_content` 回填；UI 版號改為 v1.2.13。
 
 ### 2026-09-10 v1.2.5 GTX 安全速率 + 免費備援
 

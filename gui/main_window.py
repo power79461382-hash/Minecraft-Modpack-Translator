@@ -23,6 +23,7 @@ from core.analysis_scan import (
     run_analyze_task_impl,
     scan_single_jar as core_scan_single_jar,
 )
+from core import libretranslate_service
 from core.batch_translation import batch_translate_missing as core_batch_translate_missing
 from core.string_extraction import extract_all_unique_strings as core_extract_all_unique_strings
 from core.verification import (
@@ -700,7 +701,7 @@ class ModTranslatorApp:
             "base_url": "http://127.0.0.1:5000",
             "models": ("libretranslate-local",),
             "login_url": "https://github.com/LibreTranslate/LibreTranslate",
-            "hint": "請先本機啟動 LibreTranslate（預設 http://127.0.0.1:5000）。免 Key；若實例有設 Key 再填。Docker: docker run -d -p 5000:5000 libretranslate/libretranslate",
+            "hint": "點「啟動本機」可一鍵啟動／「關閉本機」可停止。預設 http://127.0.0.1:5000，免 Key。優先 Docker；沒有則自動 pip 安裝 libretranslate。",
             "requires_key": False,
         },
         "custom": {
@@ -1158,7 +1159,7 @@ class ModTranslatorApp:
                       font=("微軟正黑體", 15),
                       relief="flat", bd=0, cursor="hand2",
                       width=3).pack(side=tk.LEFT, padx=(0, 10))
-        tk.Label(sidebar, text="v1.2.12", bg=panel2, fg=muted,
+        tk.Label(sidebar, text="v1.2.13", bg=panel2, fg=muted,
                  font=("Consolas", 9), anchor="w").pack(
                      side=tk.BOTTOM, fill=tk.X, padx=22, pady=(0, 10))
 
@@ -1486,6 +1487,15 @@ class ModTranslatorApp:
              "#17262f").pack(side=tk.LEFT, padx=(0, 8))
         pill(left_btns, "測試連線", self.test_ai_connection,
              "#17262f").pack(side=tk.LEFT)
+        self.btn_lt_start = pill(left_btns, "啟動本機", self.start_libretranslate_service,
+             "#1f6f5b")
+        self.btn_lt_start.pack(side=tk.LEFT, padx=(8, 0))
+        self.btn_lt_stop = pill(left_btns, "關閉本機", self.stop_libretranslate_service,
+             "#9b3636")
+        self.btn_lt_stop.pack(side=tk.LEFT, padx=(8, 0))
+        self._lt_service_btns = (self.btn_lt_start, self.btn_lt_stop)
+        self._update_libretranslate_service_controls()
+
 
         self.btn_stop = pill(right_btns, "停止", self.stop_process, "#9b3636", state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=(0, 8))
@@ -2374,7 +2384,7 @@ class ModTranslatorApp:
     def show_about(self):
         msg = (
             "Minecraft 模組翻譯器\n"
-            "版本：v1.2.12\n"
+            "版本：v1.2.13\n"
             "預設模型：DeepSeek V4 Flash Free (OpenRouter)\n"
             "支援：JAR 直接翻譯、自動判定、全域記憶池與多 API 模型"
         )
@@ -2798,7 +2808,129 @@ class ModTranslatorApp:
 
         self.ai_login_url_var.set(cfg.get("login_url", ""))
         self.ai_provider_hint.config(text=cfg.get("hint", ""))
+        self._update_libretranslate_service_controls()
         self._refresh_api_summary()
+
+
+    def _libretranslate_selected(self):
+        return self._ai_provider_key() == "libretranslate"
+
+    def _update_libretranslate_service_controls(self):
+        btns = getattr(self, "_lt_service_btns", None)
+        if not btns:
+            return
+        show = self._libretranslate_selected()
+        for btn in btns:
+            try:
+                if show:
+                    btn.pack(side=tk.LEFT, padx=(8, 0))
+                else:
+                    btn.pack_forget()
+            except Exception:
+                pass
+        if show:
+            self._refresh_libretranslate_service_status(silent=True)
+
+    def _refresh_libretranslate_service_status(self, silent=False):
+        if not self._libretranslate_selected():
+            return
+        base = ""
+        if hasattr(self, "ai_base_url_var"):
+            base = self.ai_base_url_var.get().strip()
+        st = libretranslate_service.status(base or libretranslate_service.DEFAULT_URL)
+        if st.get("healthy"):
+            text, color = "● 本機服務運行中", "#3dd68c"
+        elif st.get("managed_running"):
+            text, color = "● 啟動中／未就緒", "#e6b84d"
+        else:
+            text, color = "● 本機服務未啟動", "#e06c75"
+        if hasattr(self, "ai_status_labels") and "connection" in self.ai_status_labels:
+            self.ai_status_labels["connection"].config(text=text, fg=color)
+        if not silent:
+            self.log(f"INFO  LibreTranslate 狀態：{text}（{st.get('detail')}）")
+
+    def start_libretranslate_service(self):
+        if not self._libretranslate_selected():
+            messagebox.showinfo("LibreTranslate", "請先選擇 LibreTranslate（本機）供應商。")
+            return
+        base = self.ai_base_url_var.get().strip() or libretranslate_service.DEFAULT_URL
+        # If python path missing and no docker, confirm install
+        if not libretranslate_service.find_docker() and libretranslate_service.find_libretranslate_launcher() is None:
+            ok = messagebox.askyesno(
+                "安裝 LibreTranslate",
+                "這台電腦沒有 Docker，也尚未安裝 libretranslate。
+
+要現在用 pip 安裝並啟動嗎？（首次可能需數分鐘下載模型）"
+            )
+            if not ok:
+                self.log("INFO  已取消啟動 LibreTranslate 本機服務")
+                return
+            install = True
+        else:
+            install = True
+        self.log(f"INFO  正在啟動 LibreTranslate 本機服務（{base}）…")
+        self.btn_lt_start.config(state=tk.DISABLED)
+        self.btn_lt_stop.config(state=tk.DISABLED)
+
+        def work():
+            try:
+                ok, msg = libretranslate_service.start_service(
+                    base, log=lambda m: self.root.after(0, lambda: self.log(m)),
+                    install_if_missing=install,
+                )
+            except Exception as exc:
+                ok, msg = False, str(exc)
+
+            def done():
+                self.btn_lt_start.config(state=tk.NORMAL)
+                self.btn_lt_stop.config(state=tk.NORMAL)
+                if ok:
+                    self.log(f"OK    LibreTranslate：{msg}")
+                    messagebox.showinfo("LibreTranslate", msg)
+                else:
+                    self.log(f"ERR   LibreTranslate：{msg}")
+                    messagebox.showerror("LibreTranslate 啟動失敗", msg)
+                self._refresh_libretranslate_service_status(silent=True)
+
+            self.root.after(0, done)
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def stop_libretranslate_service(self):
+        if not self._libretranslate_selected():
+            messagebox.showinfo("LibreTranslate", "請先選擇 LibreTranslate（本機）供應商。")
+            return
+        base = self.ai_base_url_var.get().strip() or libretranslate_service.DEFAULT_URL
+        if not messagebox.askyesno("關閉本機服務", "確定要關閉本機 LibreTranslate 服務嗎？"):
+            return
+        self.log(f"INFO  正在關閉 LibreTranslate 本機服務（{base}）…")
+        self.btn_lt_start.config(state=tk.DISABLED)
+        self.btn_lt_stop.config(state=tk.DISABLED)
+
+        def work():
+            try:
+                ok, msg = libretranslate_service.stop_service(
+                    base, log=lambda m: self.root.after(0, lambda: self.log(m)),
+                )
+            except Exception as exc:
+                ok, msg = False, str(exc)
+
+            def done():
+                self.btn_lt_start.config(state=tk.NORMAL)
+                self.btn_lt_stop.config(state=tk.NORMAL)
+                if ok:
+                    self.log(f"OK    LibreTranslate：{msg}")
+                else:
+                    self.log(f"ERR   LibreTranslate：{msg}")
+                    messagebox.showerror("LibreTranslate 關閉失敗", msg)
+                self._refresh_libretranslate_service_status(silent=True)
+
+            self.root.after(0, done)
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
 
     def open_ai_login_page(self):
         cfg = self._ai_provider_config()
