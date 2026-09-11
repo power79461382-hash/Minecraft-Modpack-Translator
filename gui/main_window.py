@@ -2860,7 +2860,7 @@ class ModTranslatorApp:
                 "安裝 LibreTranslate",
                 "這台電腦沒有 Docker，也尚未安裝 libretranslate。
 
-要現在用 pip 安裝並啟動嗎？（首次可能需數分鐘下載模型）"
+要現在用 pip 安裝並啟動嗎？（首次可能需數分鐘下載模型）",
             )
             if not ok:
                 self.log("INFO  已取消啟動 LibreTranslate 本機服務")
