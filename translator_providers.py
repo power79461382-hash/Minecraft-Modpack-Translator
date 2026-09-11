@@ -824,8 +824,8 @@ def build_provider_registry(session, settings):
             msg = str(e)
             low = msg.lower()
             if any(x in low for x in ("connection refused", "failed to establish", "max retries", "name or service", "nodename", "actively refused")):
-                return None, "DISABLED:LibreTranslate 連不上本機服務，請先啟動 http://127.0.0.1:5000"
-            return None, f"DISABLED:LibreTranslate 連線失敗: {e}"
+                return None, "ERR:LibreTranslate 連不上本機服務，請先按「啟動本機」（http://127.0.0.1:5000）"
+            return None, f"ERR:LibreTranslate 連線失敗: {e}"
 
         if res.status_code == 200:
             data = res.json() if res.content else {}

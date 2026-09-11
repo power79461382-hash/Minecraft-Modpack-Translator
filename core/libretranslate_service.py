@@ -84,32 +84,69 @@ def find_docker() -> Optional[str]:
     return None
 
 
+def _resolve_python(cmd: str) -> Optional[str]:
+    """Resolve Windows py.exe launcher to the real interpreter path."""
+    try:
+        proc = subprocess.run(
+            [cmd, "-c", "import sys; print(sys.executable)"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if proc.returncode == 0:
+            exe = (proc.stdout or "").strip().splitlines()[-1].strip()
+            if exe and Path(exe).exists():
+                return exe
+    except Exception:
+        pass
+    return cmd if Path(cmd).exists() else None
+
+
 def _python_candidates() -> list:
     out = []
     if not getattr(sys, "frozen", False):
         out.append(sys.executable)
     for name in ("py", "python", "python3"):
         found = shutil.which(name)
-        if found and found not in out:
-            out.append(found)
+        if not found:
+            continue
+        resolved = _resolve_python(found) or found
+        if resolved not in out:
+            out.append(resolved)
     return out
 
 
 def find_libretranslate_launcher() -> Optional[Tuple[str, list]]:
-    """Return (kind, argv_prefix). kind in docker|cli|module."""
+    """Return (kind, argv_prefix). kind in cli|module.
+
+    Note: ``python -m libretranslate`` fails (no __main__). Prefer the
+    console script, then ``python -m libretranslate.main``.
+    """
     cli = shutil.which("libretranslate")
     if cli:
         return "cli", [cli]
     for py in _python_candidates():
         try:
+            py_path = Path(py).resolve()
+        except Exception:
+            py_path = Path(py)
+        for scripts in (
+            py_path.parent / "Scripts" / "libretranslate.exe",
+            py_path.parent / "Scripts" / "libretranslate",
+            py_path.parent / "libretranslate.exe",
+        ):
+            if scripts.exists():
+                return "cli", [str(scripts)]
+        try:
             proc = subprocess.run(
-                [py, "-c", "import libretranslate"],
+                [py, "-c", "import libretranslate.main"],
                 capture_output=True,
                 text=True,
                 timeout=20,
             )
             if proc.returncode == 0:
-                return "module", [py, "-m", "libretranslate"]
+                return "module", [py, "-m", "libretranslate.main"]
         except Exception:
             continue
     return None
@@ -210,11 +247,39 @@ def start_python(launcher: Tuple[str, list], host: str, port: int, log: Callable
     kind, prefix = launcher
     cmd = list(prefix) + ["--host", host, "--port", str(port)]
     log(f"INFO  以 Python 啟動 LibreTranslate：{' '.join(cmd)}")
+    log_dir = state_path().parent
+    log_dir.mkdir(parents=True, exist_ok=True)
+    out_path = log_dir / "libretranslate_stdout.log"
+    err_path = log_dir / "libretranslate_stderr.log"
     try:
-        proc = _popen(cmd)
+        out_f = open(out_path, "ab")
+        err_f = open(err_path, "ab")
+        kwargs = {"stdout": out_f, "stderr": err_f, "stdin": subprocess.DEVNULL}
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        proc = subprocess.Popen(cmd, **kwargs)
     except Exception as exc:
         return False, f"啟動失敗: {exc}"
-    save_state({"backend": kind, "pid": proc.pid, "port": port, "cmd": cmd})
+    save_state({
+        "backend": kind,
+        "pid": proc.pid,
+        "port": port,
+        "cmd": cmd,
+        "stdout_log": str(out_path),
+        "stderr_log": str(err_path),
+    })
+    time.sleep(1.5)
+    if proc.poll() is not None:
+        clear_state()
+        tail = ""
+        try:
+            tail = err_path.read_text(encoding="utf-8", errors="replace")[-800:]
+        except Exception:
+            pass
+        hint = tail.strip() or f"exit code {proc.returncode}"
+        return False, f"LibreTranslate 行程立刻結束：{hint}"
     return True, f"已啟動本機行程 PID {proc.pid}"
 
 
