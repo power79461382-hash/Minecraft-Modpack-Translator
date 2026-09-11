@@ -2852,26 +2852,23 @@ class ModTranslatorApp:
 
     def start_libretranslate_service(self):
         if not self._libretranslate_selected():
-            messagebox.showinfo("LibreTranslate", "請先選擇 LibreTranslate（本機）供應商。")
+            messagebox.showinfo("LibreTranslate", "Please select LibreTranslate (local) first.")
             return
         base = self.ai_base_url_var.get().strip() or libretranslate_service.DEFAULT_URL
-        # If python path missing and no docker, confirm install
         if not libretranslate_service.find_docker() and libretranslate_service.find_libretranslate_launcher() is None:
             prompt = (
-                "這台電腦沒有 Docker，也尚未安裝 libretranslate。"
-                "
-
-"
-                "要現在用 pip 安裝並啟動嗎？（首次可能需數分鐘下載模型）"
+                "No Docker and libretranslate is not installed."
+                + "\n\n"
+                + "Install with pip and start now? (first run may download models)"
             )
-            ok = messagebox.askyesno("安裝 LibreTranslate", prompt)
+            ok = messagebox.askyesno("Install LibreTranslate", prompt)
             if not ok:
-                self.log("INFO  已取消啟動 LibreTranslate 本機服務")
+                self.log("INFO  cancelled LibreTranslate local start")
                 return
             install = True
         else:
             install = True
-        self.log(f"INFO  正在啟動 LibreTranslate 本機服務（{base}）…")
+        self.log("INFO  starting LibreTranslate local service (" + base + ")")
         self.btn_lt_start.config(state=tk.DISABLED)
         self.btn_lt_stop.config(state=tk.DISABLED)
 
@@ -2888,17 +2885,16 @@ class ModTranslatorApp:
                 self.btn_lt_start.config(state=tk.NORMAL)
                 self.btn_lt_stop.config(state=tk.NORMAL)
                 if ok:
-                    self.log(f"OK    LibreTranslate：{msg}")
+                    self.log("OK    LibreTranslate: " + str(msg))
                     messagebox.showinfo("LibreTranslate", msg)
                 else:
-                    self.log(f"ERR   LibreTranslate：{msg}")
-                    messagebox.showerror("LibreTranslate 啟動失敗", msg)
+                    self.log("ERR   LibreTranslate: " + str(msg))
+                    messagebox.showerror("LibreTranslate start failed", msg)
                 self._refresh_libretranslate_service_status(silent=True)
 
             self.root.after(0, done)
 
         threading.Thread(target=work, daemon=True).start()
-
 
     def stop_libretranslate_service(self):
         if not self._libretranslate_selected():
