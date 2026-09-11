@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """v1.2.7: Base URL host must force matching market_ai provider/api_type."""
 
 from core.batch_translation import translation_fallback_order
@@ -62,18 +62,18 @@ def test_reconcile_unknown_url_unchanged():
 
 def test_paid_market_ai_fallback_is_gtx_with_mymemory():
     assert translation_fallback_order(
-        "market_ai", "market_ai", "deepseek") == ["gtx"]
+        "market_ai", "market_ai", "deepseek") == ["gtx", "mymemory"]
     assert translation_fallback_order(
-        "market_ai", "market_ai", "anthropic") == ["gtx"]
+        "market_ai", "market_ai", "anthropic") == ["gtx", "mymemory"]
     assert translation_fallback_order(
-        "market_ai", "market_ai", "openai") == ["gtx"]
+        "market_ai", "market_ai", "openai") == ["gtx", "mymemory"]
 
 
 def test_free_market_ai_keys_still_gtx_with_mymemory_fallback():
     assert translation_fallback_order(
-        "market_ai", "market_ai", "deepseek_v4_flash_free") == ["gtx"]
+        "market_ai", "market_ai", "deepseek_v4_flash_free") == ["gtx", "mymemory"]
     assert translation_fallback_order(
-        "market_ai", "market_ai", "openrouter_free_router") == ["gtx"]
+        "market_ai", "market_ai", "openrouter_free_router") == ["gtx", "mymemory"]
 
 
 def test_custom_not_in_named_free_provider_tuple_semantics():
