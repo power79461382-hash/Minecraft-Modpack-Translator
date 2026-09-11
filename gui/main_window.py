@@ -2849,6 +2849,7 @@ class ModTranslatorApp:
         if not silent:
             self.log(f"INFO  LibreTranslate 狀態：{text}（{st.get('detail')}）")
 
+
     def start_libretranslate_service(self):
         if not self._libretranslate_selected():
             messagebox.showinfo("LibreTranslate", "請先選擇 LibreTranslate（本機）供應商。")
@@ -2856,12 +2857,14 @@ class ModTranslatorApp:
         base = self.ai_base_url_var.get().strip() or libretranslate_service.DEFAULT_URL
         # If python path missing and no docker, confirm install
         if not libretranslate_service.find_docker() and libretranslate_service.find_libretranslate_launcher() is None:
-            ok = messagebox.askyesno(
-                "安裝 LibreTranslate",
-                "這台電腦沒有 Docker，也尚未安裝 libretranslate。
+            prompt = (
+                "這台電腦沒有 Docker，也尚未安裝 libretranslate。"
+                "
 
-要現在用 pip 安裝並啟動嗎？（首次可能需數分鐘下載模型）",
+"
+                "要現在用 pip 安裝並啟動嗎？（首次可能需數分鐘下載模型）"
             )
+            ok = messagebox.askyesno("安裝 LibreTranslate", prompt)
             if not ok:
                 self.log("INFO  已取消啟動 LibreTranslate 本機服務")
                 return
@@ -2894,8 +2897,8 @@ class ModTranslatorApp:
 
             self.root.after(0, done)
 
-        import threading
         threading.Thread(target=work, daemon=True).start()
+
 
     def stop_libretranslate_service(self):
         if not self._libretranslate_selected():
