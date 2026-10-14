@@ -1,9 +1,13 @@
 import json
 import os
-import re
 import zipfile
 
 from core.json_loader import load_json_lenient
+from core.file_parsers import (
+    iter_markdown_text_lines,
+    iter_snbt_quoted_values,
+    markdown_text_for_span,
+)
 from translation_packager import (
     load_json_content,
     load_lang_content,
@@ -73,11 +77,10 @@ def extract_all_unique_strings(self):
                 continue
             if file_type == 'snbt':
                 # FTB Quests .snbt：只收集有引號的字串值（跳過技術性欄位）
-                for m in self._RE_QUOTED_STR.finditer(content):
+                for m, snbt_key in iter_snbt_quoted_values(self, content):
                     val = self._decode_snbt_string(m.group(1))
-                    if self._snbt_skip_by_key(content, m.start()):
+                    if snbt_key and self._is_technical_data_key(snbt_key):
                         continue
-                    snbt_key = self._snbt_key_for_value(content, m.start())
                     if (self.strict_whitelist_var.get() and snbt_key
                             and not self._is_strict_text_key(snbt_key)):
                         continue
@@ -95,21 +98,11 @@ def extract_all_unique_strings(self):
                     if entry and self.should_translate(entry):
                         unique_strings.add(entry)
             elif file_type == 'md':
-                # Markdown：逐行收集
-                in_yaml = False
-                for line in content.split('\n'):
-                    stripped = line.strip()
-                    if stripped == '---':
-                        in_yaml = not in_yaml
-                        continue
-                    if in_yaml:
-                        m = re.match(r'^\s*title\s*:\s*[\'"]?(.*?)[\'"]?\s*$', line, re.IGNORECASE)
-                        if m and self.should_translate(m.group(1).strip()):
-                            unique_strings.add(m.group(1).strip())
-                        continue
-                    if stripped and not stripped.startswith(('```', '#!')):
-                        if self.should_translate(stripped):
-                            unique_strings.add(stripped)
+                for line, span in iter_markdown_text_lines(content):
+                    if span is not None:
+                        text = markdown_text_for_span(line, span)
+                        if text and self.should_translate(text):
+                            unique_strings.add(text)
             elif file_type == 'json':
                 data = load_json_lenient(content, self._clean_json_text)
                 self._collect_strings_json(

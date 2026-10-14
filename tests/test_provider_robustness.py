@@ -86,12 +86,11 @@ def make_gtx(monkeypatch, singleton_response):
     return registry["gtx"], fake_session
 
 
-def test_ai_chunk_rejects_missing_expected_numeric_key():
-    result, error = call_ai_chunk({"0": "translated-0"}, ["source-0", "source-1"])
-
-    assert result is None
-    assert error.startswith("ERR:FakeAI")
-    assert "1" in error
+def test_translation_json_rejects_missing_expected_numeric_key():
+    # ai_chunk can recover by splitting and issuing source-specific requests.
+    # The parser must still reject an incomplete batch before recovery begins.
+    with pytest.raises(TypeError, match="key '1'"):
+        providers._parse_translation_json('{"0":"translated-0"}', 2)
 
 
 def test_ai_chunk_rejects_non_string_expected_value():
@@ -144,7 +143,8 @@ def test_gtx_depth_cap_propagates_single_item_rate_limit(monkeypatch):
     result, error = gtx(sources)
 
     assert result == [None] * len(sources)
-    assert error == "429:30"
+    assert error.startswith("429:")
+    assert float(error.split(":", 1)[1]) >= 15
     assert fake_session.singleton_queries == sources
 
 

@@ -228,6 +228,16 @@ def extract_ai_text(content):
     return "" if content is None else str(content)
 
 
+def normalize_market_ai_model(provider_key, model):
+    """Migrate retired direct MiMo IDs while preserving the selected model tier."""
+    if not isinstance(model, str):
+        return ""
+    if provider_key == "xiaomi_mimo":
+        return {"mimo-v2.5-pro": "mimo-v2.6-pro",
+                "mimo-v2.5": "mimo-v2.6-flash"}.get(model, model)
+    return model
+
+
 def make_chat_body(model, chunk_dict, max_out=4096, token_param="max_tokens",
                    extra_body=None):
     body = {
@@ -301,9 +311,22 @@ def _parse_translation_json(content, expected_count):
     return parsed
 
 
+def _redact_error_detail(detail, secrets):
+    text = str(detail)
+    for secret in sorted({str(value) for value in secrets if value}, key=len, reverse=True):
+        text = text.replace(secret, "[REDACTED]")
+    return text
+
+
 def ai_chunk(session, chunk_data, post_url, req_headers, make_body,
-             parse_resp, eng_name, request_timeout=(10, 150), max_batch=20):
+             parse_resp, eng_name, request_timeout=(10, 150), max_batch=20,
+             should_stop=None):
     """Shared JSON-in/JSON-out translator for LLM providers."""
+    if should_stop is not None and should_stop():
+        return [None] * len(chunk_data), None
+    secrets = [value.split(" ", 1)[-1] if name.lower() == "authorization" else value
+               for name, value in req_headers.items()
+               if name.lower() in ("authorization", "x-api-key", "x-goog-api-key")]
     max_batch = max(1, int(max_batch or 20))
     if len(chunk_data) > max_batch:
         results = []
@@ -311,7 +334,7 @@ def ai_chunk(session, chunk_data, post_url, req_headers, make_body,
             sub = chunk_data[i:i + max_batch]
             sub_res, err = ai_chunk(session, sub, post_url, req_headers,
                                     make_body, parse_resp, eng_name,
-                                    request_timeout, max_batch)
+                                    request_timeout, max_batch, should_stop)
             if err:
                 return None, err
             results.extend(sub_res)
@@ -324,12 +347,12 @@ def ai_chunk(session, chunk_data, post_url, req_headers, make_body,
         mid = max(1, len(chunk_data) // 2)
         left, err = ai_chunk(session, chunk_data[:mid], post_url, req_headers,
                              make_body, parse_resp, eng_name,
-                             request_timeout, max_batch)
+                             request_timeout, max_batch, should_stop)
         if err:
             return None, err
         right, err = ai_chunk(session, chunk_data[mid:], post_url, req_headers,
                               make_body, parse_resp, eng_name,
-                              request_timeout, max_batch)
+                              request_timeout, max_batch, should_stop)
         if err:
             return None, err
         return left + right, None
@@ -340,12 +363,15 @@ def ai_chunk(session, chunk_data, post_url, req_headers, make_body,
                            json=make_body(chunk_dict), timeout=request_timeout)
         if res.status_code == 200:
             payload = res.json()
-            finish_reason = ""
+            finish_reason = str(payload.get("stop_reason") or "") if isinstance(payload, dict) else ""
             try:
-                finish_reason = str(payload.get("choices", [{}])[0].get("finish_reason") or "")
+                if payload.get("choices"):
+                    finish_reason = str(payload["choices"][0].get("finish_reason") or "")
+                elif payload.get("candidates"):
+                    finish_reason = str(payload["candidates"][0].get("finishReason") or "")
             except Exception:
-                finish_reason = ""
-            content = parse_resp(payload).strip()
+                pass
+            content = extract_ai_text(parse_resp(payload)).strip()
             if not content:
                 try:
                     msg = payload.get("choices", [{}])[0].get("message") or {}
@@ -370,7 +396,8 @@ def ai_chunk(session, chunk_data, post_url, req_headers, make_body,
             return [trans_dict[str(i)]
                     for i in range(len(chunk_data))], None
         if res.status_code == 429:
-            return None, "429:60"
+            headers = getattr(res, "headers", {}) or {}
+            return None, f"429:{parse_retry_after_seconds(headers.get('Retry-After'), default=60)}"
         if res.status_code == 529:
             return None, "429:30"
         if res.status_code == 402:
@@ -387,14 +414,14 @@ def ai_chunk(session, chunk_data, post_url, req_headers, make_body,
                 'billing', 'payment required', 'credits or licenses',
                 'doesn\\u0027t have any credits', "doesn't have any credits")):
             return None, f"DISABLED:{eng_name} API 額度已用盡"
-        return None, f"ERR:{eng_name} HTTP {res.status_code}: {res.text[:100]}"
+        return None, f"ERR:{eng_name} HTTP {res.status_code}: {_redact_error_detail(res.text, secrets)[:100]}"
     except json.JSONDecodeError as e:
         detail = str(e)
         if "Unterminated string" in detail or "Expecting value" in detail:
             return None, f"ERR:{eng_name} 回應不是完整 JSON（可能被截斷或模型未遵守 JSON 輸出）: {detail}"
         return None, f"ERR:{eng_name} JSON 解析失敗: {detail}"
-    except (requests.RequestException, KeyError, IndexError, TypeError) as e:
-        return None, f"ERR:{eng_name} 錯誤: {e}"
+    except (requests.RequestException, KeyError, IndexError, TypeError, AttributeError) as e:
+        return None, f"ERR:{eng_name} 錯誤: {_redact_error_detail(e, secrets)}"
 
 
 def _openrouter_headers(headers, provider_key, base_url):
@@ -420,7 +447,7 @@ def build_provider_registry(session, settings):
     ai_provider_cfg = settings.get("ai_provider_cfg", {})
     ai_api_key = settings.get("ai_api_key", "")
     ai_api_keys = settings.get("ai_api_keys", None) or []
-    ai_model = settings.get("ai_model", "")
+    ai_model = normalize_market_ai_model(ai_provider_key, settings.get("ai_model", ""))
     ai_base_url = settings.get("ai_base_url", "")
     ai_label = settings.get("ai_label", "AI")
     should_stop = settings.get("should_stop", lambda: False)
@@ -636,7 +663,7 @@ def build_provider_registry(session, settings):
                 return None, "429:30"
             return None, f"ERR:Google API HTTP {res.status_code}"
         except requests.RequestException as e:
-            return None, f"ERR:Google 連線失敗: {e}"
+            return None, f"ERR:Google 連線失敗: {_redact_error_detail(e, [google_key])}"
 
     def deepl(chunk_data):
         base_url = ("https://api-free.deepl.com/v2/translate"
@@ -733,7 +760,8 @@ def build_provider_registry(session, settings):
                                          json.dumps(d, ensure_ascii=False))}]},
             lambda r: extract_ai_text(r['content']),
             "Claude",
-            max_batch=model_batch_limit(claude_model, 60)
+            max_batch=model_batch_limit(claude_model, 60),
+            should_stop=should_stop,
         )
 
     def openai(chunk_data):
@@ -746,7 +774,8 @@ def build_provider_registry(session, settings):
             lambda d: make_chat_body(openai_model, d, 4096, "max_completion_tokens"),
             lambda r: extract_openai_message_text(r['choices'][0]['message']),
             "OpenAI",
-            max_batch=model_batch_limit(openai_model, 40)
+            max_batch=model_batch_limit(openai_model, 40),
+            should_stop=should_stop,
         )
 
     def local(chunk_data):
@@ -761,7 +790,8 @@ def build_provider_registry(session, settings):
                        "temperature": 0.1, "max_tokens": 2048},
             lambda r: extract_openai_message_text(r['choices'][0]['message']),
             "LocalAI",
-            max_batch=30
+            max_batch=30,
+            should_stop=should_stop,
         )
 
     def libretranslate(chunk_data):
@@ -1098,7 +1128,8 @@ def build_provider_registry(session, settings):
                     lambda r: extract_ai_text(r['content']),
                     ai_label,
                     request_timeout,
-                    max_batch=model_batch_limit(ai_model, 60)
+                    max_batch=model_batch_limit(ai_model, 60),
+                    should_stop=should_stop,
                 )
                 if err and err.startswith("DISABLED:") and key_idx >= 0 and len(ai_api_keys) > 1:
                     disable_ai_key(key_idx)
@@ -1126,7 +1157,8 @@ def build_provider_registry(session, settings):
                         r['candidates'][0]['content'].get('parts', [])),
                     ai_label,
                     request_timeout,
-                    max_batch=model_batch_limit(ai_model, 40)
+                    max_batch=model_batch_limit(ai_model, 40),
+                    should_stop=should_stop,
                 )
                 if err and err.startswith("DISABLED:") and key_idx >= 0 and len(ai_api_keys) > 1:
                     disable_ai_key(key_idx)
@@ -1155,7 +1187,8 @@ def build_provider_registry(session, settings):
                 lambda r: extract_openai_message_text(r['choices'][0]['message']),
                 ai_label,
                 request_timeout,
-                max_batch=model_batch_limit(ai_model, 40)
+                max_batch=model_batch_limit(ai_model, 40),
+                should_stop=should_stop,
             )
             if err and err.startswith("DISABLED:") and key_idx >= 0 and len(ai_api_keys) > 1:
                 disable_ai_key(key_idx)

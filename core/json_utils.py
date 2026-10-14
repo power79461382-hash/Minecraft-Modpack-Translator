@@ -39,11 +39,13 @@ def clean_json_text(text):
                 i += 1
                 continue
             if c == '/' and n == '/':
+                out.append(' ')
                 i += 2
                 while i < len(src) and src[i] not in '\r\n':
                     i += 1
                 continue
             if c == '/' and n == '*':
+                out.append(' ')
                 i += 2
                 while i + 1 < len(src) and not (src[i] == '*' and src[i + 1] == '/'):
                     i += 1

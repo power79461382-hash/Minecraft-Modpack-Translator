@@ -341,9 +341,11 @@ def merge_zh_base_fallback(fallback_base, primary_base):
     but fills missing nested dict/list entries from zh_cn before Traditional
     conversion happens later in the packaging flow.
     """
-    if not primary_base:
+    if primary_base is None or (isinstance(primary_base, (str, dict, list))
+                                and not primary_base):
         return fallback_base
-    if not fallback_base:
+    if fallback_base is None or (isinstance(fallback_base, (str, dict, list))
+                                 and not fallback_base):
         return primary_base
     if isinstance(fallback_base, dict) and isinstance(primary_base, dict):
         merged = dict(fallback_base)

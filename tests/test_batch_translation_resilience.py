@@ -133,6 +133,15 @@ class FakeApp:
         self.errors += errors
 
 
+def selected_bing_app(workers=1):
+    app = FakeApp(workers=workers, engine="market_ai")
+    app._ai_provider_key = lambda: "bing_free"
+    app._ai_provider_config = lambda: {
+        "api_type": "bing", "requires_key": False, "models": ("fake-model",),
+    }
+    return app
+
+
 def test_failed_first_wave_still_drains_all_chunks(monkeypatch):
     app = FakeApp(workers=2)
 
@@ -169,7 +178,7 @@ def test_exceptional_first_wave_still_drains_all_chunks(monkeypatch):
     monkeypatch.setattr(
         batch_module,
         "build_provider_registry",
-        lambda _session, _settings: {"bing": crashing},
+        lambda _session, _settings: {"gtx": crashing},
     )
 
     batch_module.batch_translate_missing(
@@ -186,26 +195,25 @@ def test_incomplete_primary_result_fails_over(monkeypatch):
     calls = []
 
     def incomplete(chunk):
-        calls.append(("bing", list(chunk)))
+        calls.append(("gtx", list(chunk)))
         return [None] * len(chunk), None
 
     def backup(chunk):
-        calls.append(("azure", list(chunk)))
+        calls.append(("mymemory", list(chunk)))
         return [f"譯文:{item}" for item in chunk], None
 
     monkeypatch.setattr(
         batch_module,
         "build_provider_registry",
         lambda _session, _settings: {
-            "bing": incomplete,
-            "azure": backup,
-            "gtx": backup,
+            "gtx": incomplete,
+            "mymemory": backup,
         },
     )
 
     batch_module.batch_translate_missing(app, ["source"], _force_chunk_size=1)
 
-    assert calls == [("bing", ["source"]), ("azure", ["source"])]
+    assert calls == [("gtx", ["source"]), ("mymemory", ["source"])]
     assert app.translation_cache == {"source": "譯文:source"}
     assert app.translated == 1
     assert app.skipped == 0
@@ -231,7 +239,7 @@ def test_incomplete_split_retry_activates_paid_backup(monkeypatch):
         return [None], None
 
     def backup(chunk):
-        calls.append(("bing", list(chunk)))
+        calls.append(("gtx", list(chunk)))
         return [f"譯文:{item}" for item in chunk], None
 
     monkeypatch.setattr(
@@ -239,7 +247,7 @@ def test_incomplete_split_retry_activates_paid_backup(monkeypatch):
         "build_provider_registry",
         lambda _session, _settings: {
             "openai": incomplete_after_timeout,
-            "bing": backup,
+            "gtx": backup,
         },
     )
 
@@ -249,7 +257,7 @@ def test_incomplete_split_retry_activates_paid_backup(monkeypatch):
     assert calls == [
         ("openai", ["source-0", "source-1"]),
         ("openai", ["source-0"]),
-        ("bing", ["source-0", "source-1"]),
+        ("gtx", ["source-0", "source-1"]),
     ]
     assert app.translation_cache == {
         "source-0": "譯文:source-0",
@@ -265,7 +273,7 @@ def test_session_keys_include_only_pairs_accepted_by_cache(monkeypatch):
         batch_module,
         "build_provider_registry",
         lambda _session, _settings: {
-            "bing": lambda chunk: ([f"translated:{item}" for item in chunk], None),
+            "gtx": lambda chunk: ([f"translated:{item}" for item in chunk], None),
         },
     )
 
@@ -278,7 +286,7 @@ def test_session_keys_include_only_pairs_accepted_by_cache(monkeypatch):
     assert app.skipped == 1
 
 
-def test_backup_route_does_not_stampede_azure(monkeypatch):
+def test_backup_route_does_not_stampede_gtx(monkeypatch):
     app = FakeApp(workers=16, engine="openai")
     app.azure_key_var = Value("test-key")
     active = 0
@@ -288,7 +296,7 @@ def test_backup_route_does_not_stampede_azure(monkeypatch):
     def disabled(_chunk):
         return None, "DISABLED:test provider unavailable"
 
-    def azure(chunk):
+    def gtx(chunk):
         nonlocal active, max_active
         with active_lock:
             active += 1
@@ -305,22 +313,45 @@ def test_backup_route_does_not_stampede_azure(monkeypatch):
         "build_provider_registry",
         lambda _session, _settings: {
             "openai": disabled,
-            "bing": disabled,
-            "azure": azure,
-            "gtx": lambda chunk: ([f"GTX:{item}" for item in chunk], None),
+            "gtx": gtx,
         },
     )
 
     batch_module.batch_translate_missing(
         app, [f"source-{index}" for index in range(16)], _force_chunk_size=1)
 
-    assert max_active == 5
+    assert max_active == 6
     assert len(app.translation_cache) == 16
 
 
-def test_non_ai_chain_has_failover_wait_budget():
-    assert batch_module.translation_wait_budget("non_ai_chain", False) == 180
-    assert batch_module.translation_wait_budget("openai", True) == 300
+@pytest.mark.parametrize("cooldown, succeeds", [(200, True), (300, False)])
+def test_non_ai_chain_retries_cooldown_within_bounded_wait_budget(
+        monkeypatch, cooldown, succeeds):
+    app = FakeApp(workers=1)
+    now = [1000.0]
+    calls = []
+
+    def gtx(chunk):
+        calls.append(list(chunk))
+        if len(calls) == 1:
+            return None, f"429:{cooldown}"
+        return ["translated"], None
+
+    def advance_clock(_should_stop, seconds, quantum=0.2):
+        now[0] += seconds
+        return True
+
+    monkeypatch.setattr(batch_module.time, "time", lambda: now[0])
+    monkeypatch.setattr(batch_module.random, "uniform", lambda _lo, _hi: 0.0)
+    monkeypatch.setattr(batch_module, "interruptible_sleep", advance_clock)
+    monkeypatch.setattr(batch_module, "build_provider_registry",
+                        lambda _session, _settings: {"gtx": gtx})
+
+    batch_module.batch_translate_missing(app, ["source"], _force_chunk_size=1)
+
+    assert app.translation_cache == ({"source": "translated"} if succeeds else {})
+    assert app.progress[-1][:2] == (1, 1)
+    assert len(calls) == (2 if succeeds else 1)
 
 
 def test_paid_azure_timeouts_activate_backup_after_three_failures(monkeypatch):
@@ -429,7 +460,7 @@ def test_paid_azure_transient_circuit_recovers_after_cooldown(monkeypatch):
 )
 def test_bing_temporary_errors_do_not_use_rate_limit_cooldown(
         monkeypatch, error, expected_cooldown):
-    app = FakeApp(workers=1)
+    app = selected_bing_app()
     calls = []
     normalized = []
 
@@ -464,7 +495,7 @@ def test_bing_temporary_errors_do_not_use_rate_limit_cooldown(
 
 
 def test_bing_rate_limit_log_says_fallback_does_not_block(monkeypatch):
-    app = FakeApp(workers=1)
+    app = selected_bing_app()
 
     monkeypatch.setattr(
         batch_module,
@@ -487,7 +518,7 @@ def test_bing_rate_limit_log_says_fallback_does_not_block(monkeypatch):
 
 
 def test_concurrent_short_cooldown_does_not_shorten_rate_limit(monkeypatch):
-    app = FakeApp(workers=2)
+    app = selected_bing_app(workers=2)
     now = [1000.0]
     calls = []
     bing_calls = 0
@@ -535,7 +566,7 @@ def test_concurrent_short_cooldown_does_not_shorten_rate_limit(monkeypatch):
 
 
 def test_temporary_errors_use_recoverable_circuit(monkeypatch):
-    app = FakeApp(workers=1)
+    app = selected_bing_app()
     now = [1000.0]
     calls = []
     bing_calls = 0

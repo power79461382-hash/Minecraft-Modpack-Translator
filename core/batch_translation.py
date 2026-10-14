@@ -688,6 +688,9 @@ def batch_translate_missing(self, missing_strings, _force_chunk_size=None,
                                 [masked_chunk[i] for i in retry_idx])
                             if sub_err is _ENGINE_RESELECT:
                                 continue
+                            if sub_err is None and not _translation_result_is_complete(
+                                    retry_idx, sub_trans):
+                                sub_err = _incomplete_result_error(nxt)
                             if sub_err or not sub_trans:
                                 if sub_err and sub_err.startswith("429:"):
                                     try:

@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import os
 import sys
 import tkinter as tk
@@ -6,12 +7,17 @@ import tkinter as tk
 from MinecraftTranslatorGUI import ModTranslatorApp
 
 
+def _print_safe(message, stream=None):
+    stream = sys.stdout if stream is None else stream
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    safe = str(message).encode(encoding, errors="replace").decode(
+        encoding, errors="replace")
+    print(safe, file=stream, flush=True)
+
+
 class CliModTranslatorApp(ModTranslatorApp):
     def log(self, message):
-        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-        safe = str(message).encode(encoding, errors="replace").decode(
-            encoding, errors="replace")
-        print(safe, flush=True)
+        _print_safe(message)
 
     def _ask_proceed_from_thread(self, title, msg):
         self.log(f"[CLI] {title}: {msg}")
@@ -23,7 +29,7 @@ class CliModTranslatorApp(ModTranslatorApp):
         step = max(1, total // 20)
         if current == total or current % step == 0:
             unit = "strings" if text_mode else "files"
-            print(f"[progress] {current}/{total} {unit}", flush=True)
+            _print_safe(f"[progress] {current}/{total} {unit}")
 
     def _set_summary_card(self, *args, **kwargs):
         return None
@@ -62,7 +68,7 @@ def parse_args():
         "claude", "openai", "local"))
     parser.add_argument("--provider", help="Market AI provider label, e.g. DeepSeek, Kimi / Moonshot")
     parser.add_argument("--model", help="Model id")
-    parser.add_argument("--base-url", help="OpenAI-compatible base URL")
+    parser.add_argument("--base-url", help="Market AI base URL or local engine endpoint")
     parser.add_argument("--api-key", help="Provider API key")
     return parser.parse_args()
 
@@ -118,74 +124,131 @@ def apply_filters(app, args):
             app.analyzed_loose = []
         if remaining > 0:
             app.analyzed_extra = app.analyzed_extra[:remaining]
+            remaining -= len(app.analyzed_extra)
         else:
             app.analyzed_extra = []
+
+        def limited_nested_targets(targets):
+            nonlocal remaining
+            selected_targets = {}
+            if not isinstance(targets, dict):
+                return selected_targets
+            for archive_path, files in targets.items():
+                selected_files = {}
+                for internal_path, value in files.items():
+                    if remaining <= 0:
+                        break
+                    selected_files[internal_path] = value
+                    remaining -= 1
+                if selected_files:
+                    selected_targets[archive_path] = selected_files
+            return selected_targets
+
+        # Every file that extraction/packaging can consume shares the same
+        # limit, including manuals and optional class tooltips inside archives.
+        for name in ("analyzed_book_texts", "analyzed_book_text_repairs",
+                     "analyzed_class_texts", "analyzed_static_assets"):
+            if hasattr(app, name):
+                setattr(app, name, limited_nested_targets(getattr(app, name)))
+        if hasattr(app, "analyzed_zip_json"):
+            app.analyzed_zip_json = app.analyzed_zip_json[:remaining]
 
 
 def main():
     args = parse_args()
     modpack = os.path.abspath(args.modpack)
     if not os.path.isdir(modpack):
-        print(f"Modpack folder not found: {modpack}", file=sys.stderr)
+        _print_safe(f"Modpack folder not found: {modpack}", sys.stderr)
         return 2
 
     output_dir = os.path.abspath(args.output_dir or os.getcwd())
     if not os.path.isdir(output_dir):
-        print(f"Output folder not found: {output_dir}", file=sys.stderr)
+        _print_safe(f"Output folder not found: {output_dir}", sys.stderr)
         return 2
     output_name = ModTranslatorApp._safe_zip_filename(
         args.name, "Auto_Translated_Mods_zh_tw")
 
-    root = tk.Tk()
-    root.withdraw()
-    app = CliModTranslatorApp(root)
-    app._server_mode_requested = bool(getattr(args, "server_mode", False))
-    app.mod_dir_var.set(modpack)
-    app.rp_dir_var.set(output_dir)
-    app.rp_name_var.set(output_name)
-    app.output_mode_var.set(args.output_mode)
-    if args.retry is not None:
-        app.retry_count_var.set(max(0, min(10, args.retry)))
-    if args.engine:
-        app.engine_var.set(args.engine)
-    if args.provider:
-        app.ai_provider_var.set(args.provider)
-        app._on_ai_provider_change()
-    if args.model:
-        app.ai_model_var.set(args.model)
-    if args.base_url:
-        app.ai_base_url_var.set(args.base_url)
-    if args.api_key:
-        app.ai_api_key_var.set(args.api_key)
+    root = None
+    app = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        app = CliModTranslatorApp(root)
+        app._server_mode_requested = bool(getattr(args, "server_mode", False))
+        app.mod_dir_var.set(modpack)
+        app.rp_dir_var.set(output_dir)
+        app.rp_name_var.set(output_name)
+        app.output_mode_var.set(args.output_mode)
+        if args.retry is not None:
+            app.retry_count_var.set(max(0, min(10, args.retry)))
+        if args.engine:
+            app.engine_var.set(args.engine)
+        if args.provider:
+            app.ai_provider_var.set(args.provider)
+            app._on_ai_provider_change()
+        selected_engine = args.engine or app.engine_var.get()
+        if args.model:
+            model_field = {
+                "openai": "openai_model_var", "claude": "claude_model_var",
+            }.get(selected_engine, "ai_model_var")
+            getattr(app, model_field).set(args.model)
+        if args.base_url:
+            endpoint_field = "local_url_var" if selected_engine == "local" else "ai_base_url_var"
+            getattr(app, endpoint_field).set(args.base_url)
+        if args.api_key:
+            key_field = {
+                "google": "api_key_var", "deepl": "deepl_key_var",
+                "azure": "azure_key_var", "claude": "claude_key_var",
+                "openai": "openai_key_var",
+            }.get(selected_engine, "ai_api_key_var")
+            getattr(app, key_field).set(args.api_key)
 
-    clear_previous_analysis(app)
-    app.analyzed_mc_dir = modpack
-    app._analyze_task(modpack)
-    root.update()
-    apply_filters(app, args)
+        clear_previous_analysis(app)
+        app.analyzed_mc_dir = modpack
+        app._analyze_task(modpack)
+        root.update()
+        if getattr(app, "_last_analysis_succeeded", True) is False:
+            _print_safe("Scan failed or was cancelled; no translation executed.", sys.stderr)
+            return 1
+        apply_filters(app, args)
 
-    unique_strings = app.extract_all_unique_strings()
-    print("")
-    print("Scan summary")
-    print(f"  JARs: {len(app.analyzed_jars)}")
-    print(f"  loose lang files: {len(app.analyzed_loose)}")
-    print(f"  extra files: {len(app.analyzed_extra)}")
-    print(f"  unique strings: {len(unique_strings)}")
-    for sample in sorted(unique_strings, key=lambda s: (-len(s), s))[:5]:
-        text = f"  sample: {sample[:120].replace(chr(10), ' ')}"
-        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-        print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"))
+        unique_strings = app.extract_all_unique_strings()
+        # Translation reuses the scan snapshot; replace it after CLI filters so
+        # excluded files cannot still trigger translation requests.
+        app._analysis_unique_strings = set(unique_strings)
+        _print_safe("")
+        _print_safe("Scan summary")
+        _print_safe(f"  JARs: {len(app.analyzed_jars)}")
+        _print_safe(f"  loose lang files: {len(app.analyzed_loose)}")
+        _print_safe(f"  extra files: {len(app.analyzed_extra)}")
+        _print_safe(f"  unique strings: {len(unique_strings)}")
+        for sample in sorted(unique_strings, key=lambda s: (-len(s), s))[:5]:
+            _print_safe(f"  sample: {sample[:120].replace(chr(10), ' ')}")
 
-    if args.dry_run:
-        print("[dry-run] No translation executed.")
-        root.destroy()
+        if args.dry_run:
+            _print_safe("[dry-run] No translation executed.")
+            return 0
+
+        pack_format = app.pack_format_var.get()
+        app._translate_task(output_dir, output_name, pack_format, args.output_mode)
+        root.update()
+        if getattr(app, "_last_translation_succeeded", True) is False:
+            _print_safe("Translation failed or was cancelled; see the log above.", sys.stderr)
+            return 1
         return 0
-
-    pack_format = app.pack_format_var.get()
-    app._translate_task(output_dir, output_name, pack_format, args.output_mode)
-    root.update()
-    root.destroy()
-    return 0
+    except Exception as error:
+        # Provider exceptions may contain credentials or query parameters.
+        _print_safe(f"CLI failed ({type(error).__name__}).", sys.stderr)
+        return 1
+    finally:
+        cache = getattr(app, "translation_cache", None)
+        close = getattr(cache, "close", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()
+        if root is not None:
+            with contextlib.suppress(Exception):
+                root.destroy()
 
 
 if __name__ == "__main__":

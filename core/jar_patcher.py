@@ -118,6 +118,7 @@ def rebuild_jar_with_inject(jar_path: str, temp_jar: str,
     """完整重建 JAR 並注入翻譯資源；必要時移除過期簽名。"""
     with zipfile.ZipFile(jar_path, 'r') as src_jar, \
             zipfile.ZipFile(temp_jar, 'w') as dst_jar:
+        dst_jar.comment = src_jar.comment
         src_names = {i.filename for i in src_jar.infolist()}
         modifies_existing = any(p in src_names for p in inject)
         stripped_sig = False
