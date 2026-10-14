@@ -2,6 +2,56 @@ import json
 import re
 
 
+_RE_SNBT_TOKEN = re.compile(
+    r'//[^\r\n]*|/\*.*?\*/'
+    r'|"((?:[^"\\]|\\.)*)"'
+    r"|'((?:[^'\\]|\\.)*)'"
+    r'|[{}\[\]:,]|[^\s{}\[\]:,"\'/]+',
+    re.DOTALL)
+
+
+def iter_snbt_quoted_values(self, content):
+    """Yield double-quoted values with their field, tracking nested containers.
+
+    Technical fields protect their entire subtree. Keys and comment strings
+    never become translation input, and list values inherit the list's field.
+    """
+    tokens = (match for match in _RE_SNBT_TOKEN.finditer(content)
+              if not match.group(0).startswith(('//', '/*')))
+    stack = [{'kind': '{', 'key': None, 'owner': None, 'technical': None}]
+    current = next(tokens, None)
+    while current is not None:
+        following = next(tokens, None)
+        token = current.group(0)
+        frame = stack[-1]
+        key = frame['key'] if frame['kind'] == '{' else frame['owner']
+        effective_key = frame['technical'] or key
+        if following is not None and following.group(0) == ':':
+            if current.group(1) is not None:
+                frame['key'] = self._decode_snbt_string(current.group(1))
+            elif current.group(2) is not None:
+                frame['key'] = current.group(2)
+            else:
+                frame['key'] = token
+        elif token in ('{', '['):
+            technical = frame['technical']
+            if key and self._is_technical_data_key(key):
+                technical = key
+            if frame['kind'] == '{':
+                frame['key'] = None
+            stack.append({'kind': token, 'key': None,
+                          'owner': key, 'technical': technical})
+        elif token in ('}', ']'):
+            if len(stack) > 1:
+                stack.pop()
+        elif token not in (':', ','):
+            if current.group(1) is not None:
+                yield current, effective_key
+            if frame['kind'] == '{':
+                frame['key'] = None
+        current = following
+
+
 def process_advancement_json(self, data):
     """Advancement 只能翻譯 display.title / display.description 的顯示文字
     （含元件陣列與 extra 巢狀形態）。criteria、requirements、trigger、conditions
@@ -81,7 +131,7 @@ def process_text_file(self, content):
     """處理含有引號字串的純文字檔（如 .snbt），替換所有可翻譯字串。
     輸出前做結構驗證：翻譯後的括號/字串數必須與原檔一致，
     否則整檔退回原文（FTB Quests 的 snbt 解析失敗會讓任務書整章消失）。"""
-    def replacer(match):
+    def replacer(match, snbt_key):
         if self.stop_requested:
             return match.group(0)
         # 引號字串若是「鍵」（後面跟著冒號）絕不能翻譯——
@@ -91,7 +141,6 @@ def process_text_file(self, content):
             return match.group(0)
         raw_text = match.group(1)
         text = self._decode_snbt_string(raw_text)
-        snbt_key = self._snbt_key_for_value(content, match.start())
         if snbt_key and snbt_key.lower() == "type":
             repaired = self._repair_ftbq_type_value(snbt_key, text)
             if repaired != text:
@@ -114,7 +163,14 @@ def process_text_file(self, content):
         # 跳脫翻譯結果中的特殊字元，確保插回 SNBT 後語法仍合法
         # （防止翻譯文字含有 ASCII 雙引號時破壞 SNBT 結構，導致伺服器 FTBQuests 崩潰）
         return f'"{self._snbt_escape(translated)}"'
-    translated_content = self._RE_QUOTED_STR.sub(replacer, content)
+    parts = []
+    cursor = 0
+    for match, snbt_key in iter_snbt_quoted_values(self, content):
+        parts.append(content[cursor:match.start()])
+        parts.append(replacer(match, snbt_key))
+        cursor = match.end()
+    parts.append(content[cursor:])
+    translated_content = ''.join(parts)
     if translated_content != content:
         # 只比對「前後簽章是否一致」：簽章解析器不認得 SNBT 單引號字串，
         # 含奇數個裸雙引號的合法檔案 in_str 會殘留 True——但原文與譯文一樣殘留，
@@ -128,12 +184,12 @@ def process_text_file(self, content):
 
 
 def snbt_key_for_value(self, content: str, match_start: int):
-    line_start = content.rfind('\n', 0, match_start) + 1
-    prefix = content[line_start:match_start]
-    m = self._RE_SNBT_KEY_CTX.search(prefix)
-    if not m:
-        return None
-    return m.group(1) or m.group(2)
+    for match, key in iter_snbt_quoted_values(self, content):
+        if match.start() == match_start:
+            return key
+        if match.start() > match_start:
+            break
+    return None
 
 
 def snbt_skip_by_key(self, content: str, match_start: int) -> bool:
@@ -143,35 +199,99 @@ def snbt_skip_by_key(self, content: str, match_start: int) -> bool:
     return bool(key and self._is_technical_data_key(key))
 
 
-def process_md_file(self, content):
-    """逐行翻譯 Markdown 文件"""
-    lines = content.split('\n')
-    new_lines = []
+def iter_markdown_text_lines(content):
+    """Yield original lines and spans of prose, excluding metadata and code."""
     in_yaml = False
-    for line in lines:
-        if self.stop_requested:
-            break
+    fence = None
+    for index, line in enumerate(content.splitlines(keepends=True)):
         stripped = line.strip()
-        if stripped == '---':
-            in_yaml = not in_yaml
-            new_lines.append(line)
+        if index == 0 and stripped.lstrip('\ufeff') == '---':
+            in_yaml = True
+            yield line, None
             continue
         if in_yaml:
-            m = re.match(r'^(\s*title\s*:\s*[\'"]?)(.*?)([\'"]?\s*)$', line, re.IGNORECASE)
-            if m and self.should_translate(m.group(2).strip()):
-                title = m.group(2).strip()
-                new_lines.append(m.group(1) + self.get_translation(title) + m.group(3))
+            if stripped in ('---', '...'):
+                in_yaml = False
+                yield line, None
+                continue
+            match = re.match(
+                r'^(\s*title\s*:\s*)(.*?)(\s*)$',
+                line, re.IGNORECASE)
+            if match is None:
+                yield line, None
+                continue
+            start, end = match.span(2)
+            value = match.group(2)
+            quote = value[:1] if value[:1] in ('"', "'") else ''
+            if quote:
+                if len(value) < 2 or not value.endswith(quote):
+                    yield line, None
+                    continue
+                if quote == "'":
+                    if re.fullmatch(r"'(?:[^']|'')*'", value) is None:
+                        yield line, None
+                        continue
+                    decoded = value[1:-1].replace("''", "'")
+                else:
+                    try:
+                        decoded = json.loads(value)
+                    except json.JSONDecodeError:
+                        # YAML-specific escapes need a full YAML parser.
+                        yield line, None
+                        continue
+                start += 1
+                end -= 1
             else:
-                new_lines.append(line)
+                if (value[:1] in ('!', '&', '*', '|', '>', '[', '{', '#')
+                        or re.search(r'\s#|:\s', value)):
+                    yield line, None
+                    continue
+                decoded = value
+            yield line, (start, end, quote, decoded)
             continue
-        if stripped and self.should_translate(stripped) \
-                and not stripped.startswith(('```', '#!')):
-            # 以 stripped 為快取 key（與 extract_all_unique_strings 一致）
-            # 保留原始前後空白，避免破壞縮排結構
-            translated = self.get_translation(stripped)
-            leading  = line[:len(line) - len(line.lstrip())]
-            trailing = line[len(line.rstrip()):]
-            new_lines.append(leading + translated + trailing)
+        if fence is not None:
+            if re.fullmatch(r' {0,3}' + re.escape(fence[0])
+                            + '{' + str(fence[1]) + r',}\s*', line):
+                fence = None
+            yield line, None
+            continue
+        match = re.match(r'^ {0,3}(`{3,}|~{3,})', line)
+        if match:
+            marker = match.group(1)
+            fence = marker[0], len(marker)
+            yield line, None
+            continue
+        if not stripped or stripped.startswith('#!'):
+            yield line, None
+            continue
+        yield line, (len(line) - len(line.lstrip()), len(line.rstrip()))
+
+
+def markdown_text_for_span(line, span):
+    """Return decoded YAML text or the prose used as a translation key."""
+    return span[3] if len(span) == 4 else line[span[0]:span[1]].strip()
+
+
+def process_md_file(self, content):
+    """Translate Markdown prose while preserving code and unprocessed lines."""
+    new_lines = []
+    for line, span in iter_markdown_text_lines(content):
+        if self.stop_requested or span is None:
+            new_lines.append(line)
+            continue
+        start, end = span[:2]
+        text = markdown_text_for_span(line, span)
+        if text and self.should_translate(text):
+            translated = self.get_translation(text)
+            if translated == text:
+                new_lines.append(line)
+                continue
+            if len(span) == 4:
+                if span[2]:
+                    start -= 1
+                    end += 1
+                translated = json.dumps(translated, ensure_ascii=False)
+            new_lines.append(line[:start] + translated + line[end:])
         else:
             new_lines.append(line)
-    return '\n'.join(new_lines)
+    return ''.join(new_lines)

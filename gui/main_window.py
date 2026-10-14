@@ -16,7 +16,9 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 from tkinter import ttk
 
-from translator_providers import build_provider_registry, normalize_base_url
+from translator_providers import (
+    build_provider_registry, normalize_base_url, normalize_market_ai_model,
+)
 from core.json_loader import load_json_lenient
 from core.analysis_scan import (
     run_analyze_task,
@@ -58,6 +60,7 @@ from core.format_mask import (
 from core.config_store import (
     obfuscate as core_obfuscate,
     deobfuscate as core_deobfuscate,
+    write_json_atomic,
 )
 from core.json_utils import clean_json_text as core_clean_json_text
 from core.translation_flow import (
@@ -78,6 +81,7 @@ from core.jar_patcher import (
 from translation_cache import (
     cache_snapshot,
     load_translation_cache,
+    load_legacy_cache_pickle,
     review_and_fix_cache,
     save_translation_cache,
 )
@@ -438,12 +442,12 @@ class ModTranslatorApp:
             "api_type": "openai_compatible",
             "base_url": "https://api.xiaomimimo.com/v1",
             "models": (
-                "mimo-v2.5-pro",
-                "mimo-v2.5",
+                "mimo-v2.6-pro",
+                "mimo-v2.6-flash",
             ),
             "login_url": "https://platform.xiaomimimo.com/",
-            "hint": "Xiaomi MiMo（2026-06 查證）：文字旗艦 mimo-v2.5-pro。"
-                    "V2 系列（v2-pro/v2-omni/v2-flash）2026-06-30 完全停用，已移除。需 MiMo API Key。",
+            "hint": "Xiaomi MiMo（2026-10 查證）：mimo-v2.6-pro / mimo-v2.6-flash。"
+                    "舊 v2.5 ID 於 10/21 10:00（UTC+8）停用；既有設定自動遷移至對應新版。需 MiMo API Key。",
             "requires_key": True,
             "token_param": "max_completion_tokens",
             "extra_body": {
@@ -1904,12 +1908,23 @@ class ModTranslatorApp:
         self._analysis_unique_strings = unique_strings
         cache, messages = load_translation_cache(
             self._current_cache_file(), self._RE_FORMAT, self._is_valid_trad_translation)
-        for message in messages:
-            self.log(message)
-        memory = self._load_translation_memory() if self.global_memory_var.get() else {}
+        try:
+            for message in messages:
+                self.log(message)
+            memory = self._load_translation_memory() if self.global_memory_var.get() else {}
+            cached = cache_snapshot(cache, unique_strings)
+            memory_hits = {source for source in unique_strings
+                           if self._is_valid_trad_translation(source, memory.get(source))
+                           and self.validate_translation(source, memory[source]) != source}
+            cache_hits = {source for source, target in cached.items()
+                          if self._is_valid_trad_translation(source, target)
+                          and self.validate_translation(source, target) != source}
+        finally:
+            close = getattr(cache, "close", None)
+            if callable(close):
+                close()
         total = len(unique_strings)
-        memory_hits = unique_strings & set(memory.keys())
-        hits = len((unique_strings & set(cache.keys())) | memory_hits)
+        hits = len(cache_hits | memory_hits)
         missing = max(0, total - hits)
         self._analysis_total_strings = total
         self._analysis_cache_hits = hits
@@ -1925,7 +1940,7 @@ class ModTranslatorApp:
         try:
             if os.path.exists(pkl_file):
                 with open(pkl_file, 'rb') as f:
-                    data = pickle.load(f)
+                    data = load_legacy_cache_pickle(f)
             else:
                 data = {}
                 for json_file in json_candidates:
@@ -1942,7 +1957,7 @@ class ModTranslatorApp:
                     sanitize_text(str(k)): sanitize_text(str(v)) for k, v in data.items()
                     if isinstance(k, str) and isinstance(v, str)
                 }
-        except (OSError, json.JSONDecodeError, TypeError, pickle.PickleError, EOFError):
+        except (OSError, ValueError, TypeError, pickle.PickleError, EOFError):
             self.translation_memory = {}
         return self.translation_memory
 
@@ -2794,6 +2809,10 @@ class ModTranslatorApp:
         cfg = self._ai_provider_config()
         models = list(dict.fromkeys(cfg.get("models", ())))
         self.ai_model_cb.configure(values=models)
+        migrated_model = normalize_market_ai_model(
+            self._ai_provider_key(), self.ai_model_var.get())
+        if migrated_model != self.ai_model_var.get():
+            self.ai_model_var.set(migrated_model)
         if models and self.ai_model_var.get() not in models:
             self.ai_model_var.set(models[0])
 
@@ -4335,6 +4354,8 @@ class ModTranslatorApp:
             try:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
+                if not isinstance(config, dict):
+                    raise ValueError("settings document must be a JSON object")
                 self.mod_dir_var.set(config.get('mod_dir', ''))
                 self.rp_dir_var.set(config.get('rp_dir', ''))
                 self.rp_name_var.set(config.get('rp_name', 'Auto_Translated_Mods_zh_tw'))
@@ -4361,7 +4382,9 @@ class ModTranslatorApp:
                 self.ai_auth_mode_var.set(config.get('ai_auth_mode', 'api'))
                 self.ai_api_key_var.set(self._deobfuscate(config.get('ai_api_key_enc', '')))
                 self.ai_api_keys_var.set(self._deobfuscate(config.get('ai_api_keys_enc', '')))
-                self.ai_model_var.set(config.get('ai_model', self.ai_model_var.get()))
+                self.ai_model_var.set(normalize_market_ai_model(
+                    self._ai_provider_key(), config.get('ai_model', self.ai_model_var.get()))
+                    or self.ai_model_var.get())
                 self.ai_base_url_var.set(config.get('ai_base_url', self.ai_base_url_var.get()))
                 self.ai_login_url_var.set(config.get('ai_login_url', self.ai_login_url_var.get()))
                 self.engine_var.set(self._normalize_engine_route_value(config.get('engine', 'market_ai')))
@@ -4388,7 +4411,7 @@ class ModTranslatorApp:
                 self._on_mc_version_change()
                 self._on_engine_change()
                 self._on_output_mode_change()
-            except (json.JSONDecodeError, KeyError, OSError):
+            except (ValueError, KeyError, OSError):
                 self.log("⚠️ 設定檔讀取失敗，使用預設值。")
 
     def save_config(self):
@@ -4435,8 +4458,7 @@ class ModTranslatorApp:
                 'class_tooltip_patch': self.class_tooltip_patch_var.get(),
                 'auto_normalize_endpoint': self.auto_normalize_endpoint_var.get(),
             }
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(config, f, ensure_ascii=False, indent=4)
+            write_json_atomic(self.config_file, config)
         except OSError as e:
             self.log(f"⚠️ 設定檔儲存失敗: {e}")
 
@@ -4860,10 +4882,9 @@ class ModTranslatorApp:
         # 格式代碼數量驗證：§a / &l 等代碼數量必須完全相符，防止遊戲崩潰
         # （與快取層、驗證層統一用 critical tokens，排除羅馬數字等裝飾性 token）
         orig_fmts = self._critical_format_tokens(orig)
-        if orig_fmts:
-            trans_fmts = self._critical_format_tokens(trans)
-            if Counter(orig_fmts) != Counter(trans_fmts):
-                return orig
+        trans_fmts = self._critical_format_tokens(trans)
+        if Counter(orig_fmts) != Counter(trans_fmts):
+            return orig
         if len(orig) > 0 and len(trans) > len(orig) * 5:
             return orig
         return trans
@@ -5242,28 +5263,20 @@ class ModTranslatorApp:
     def get_translation(self, text):
         use_memory = self.global_memory_var.get()
         memory = self._load_translation_memory() if use_memory else None
-        ignored = getattr(self, "_force_ignore_cache_strings", None)
-        session_keys = getattr(self, "_session_translated_keys", set())
         for candidate in self._translation_lookup_candidates(text):
-            hit = None
-            # force 模式下：如果本輪已翻譯（在 session_keys），直接用新翻譯。
-            # 如果本輪未翻到（不在 session_keys），仍允許從快取 fallback，
-            # 避免翻譯引擎未翻到的字串變成未翻譯的原文輸出。
-            if candidate in session_keys:
-                hit = self.translation_cache.get(candidate)
-            elif not ignored or candidate not in ignored:
-                hit = self.translation_cache.get(candidate)
-            else:
-                # force 模式下未翻譯的字串，也允許快取 fallback
-                hit = self.translation_cache.get(candidate)
-            # 記憶池同樣允許 fallback
-            if not hit and memory is not None:
-                hit = memory.get(candidate)
-            if not hit:
-                continue
-            hit = self._restyle_swapped_hit(text, candidate, hit)
-            hit = self.validate_translation(text, hit)
-            return sanitize_text(self._rewrap_quoted_translation(text, candidate, hit))
+            # Cache has priority, including force-mode rescue, but invalid old
+            # entries must not hide a usable memory/candidate translation.
+            hits = [self.translation_cache.get(candidate)]
+            if memory is not None:
+                hits.append(memory.get(candidate))
+            for hit in hits:
+                if not self._is_valid_trad_translation(candidate, hit):
+                    continue
+                hit = self._restyle_swapped_hit(text, candidate, hit)
+                hit = self.validate_translation(text, hit)
+                if hit == text:
+                    continue
+                return sanitize_text(self._rewrap_quoted_translation(text, candidate, hit))
         return text
 
     @staticmethod
@@ -5583,7 +5596,8 @@ class ModTranslatorApp:
             new_data = {}
             for k, v in data.items():
                 if self.stop_requested:
-                    break
+                    new_data[k] = v
+                    continue
                 if preserve_technical_keys and self._is_technical_data_key(k):
                     new_data[k] = self._repair_ftbq_type_value(k, v)
                     continue
@@ -5612,7 +5626,8 @@ class ModTranslatorApp:
             new_data = []
             for item in data:
                 if self.stop_requested:
-                    break
+                    new_data.append(item)
+                    continue
                 if isinstance(item, str):
                     if ((not strict_context or _text_parent)
                             and self.should_translate(item)):

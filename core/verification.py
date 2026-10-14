@@ -52,16 +52,13 @@ def verify_translations(self, unique_strings):
 
         t = cached_translation(s)
         if t is None:
+            t = self.get_translation(s)
             if (not self._RE_CJK_CHAR.search(s)
-                    and self.should_translate(s)
-                    and self.get_translation(s) == s):
+                    and self.should_translate(s) and t == s):
                 untranslated.append(s)
-            continue
         # 只比對「會影響遊戲運作」的格式碼（排除羅馬數字等裝飾性 token），
         # 與快取載入層 _critical_formats 的口徑一致，避免永遠清不掉的假警報
         orig_fmts = self._critical_format_tokens(s)
-        if not orig_fmts:
-            continue
         if _count(orig_fmts) != _count(self._critical_format_tokens(t)):
             fmt_issues.append((s, t))
 

@@ -4,6 +4,7 @@ import os
 import time
 import tkinter as tk
 import zipfile
+from collections import Counter
 
 from core.analysis_scan import (
     apply_pcl_java_runtime_select,
@@ -79,6 +80,22 @@ def save_post_batch_checkpoint(app):
     return not (app.stop_requested or app.pause_requested)
 
 
+def _translation_value_is_usable(app, source, translated):
+    validator = getattr(app, '_is_valid_trad_translation', None)
+    if callable(validator):
+        if not validator(source, translated):
+            return False
+    elif not (isinstance(translated, str) and translated.strip()
+              and translated != source):
+        return False
+    output_validator = getattr(app, 'validate_translation', None)
+    if callable(output_validator) and output_validator(source, translated) == source:
+        return False
+    format_tokens = getattr(app, '_critical_format_tokens', None)
+    return (not callable(format_tokens)
+            or Counter(format_tokens(source)) == Counter(format_tokens(translated)))
+
+
 def usable_cache_translation_keys(app, strings):
     """Return keys with valid cached translations using one bulk read."""
     snapshot = cache_snapshot(app.translation_cache, strings)
@@ -88,7 +105,7 @@ def usable_cache_translation_keys(app, strings):
         return {source for source in snapshot if fallback(source)}
     return {
         source for source, translated in snapshot.items()
-        if validator(source, translated)
+        if _translation_value_is_usable(app, source, translated)
     }
 
 
@@ -109,6 +126,7 @@ def remove_legacy_client_class_patch(app, output_dir, output_name):
 
 
 def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patch"):
+    self._last_translation_succeeded = False
     output_mode = output_mode if output_mode in ("resource_pack", "hybrid", "jar_patch") else "hybrid"
     self._active_output_mode = output_mode
     pack_format = int(getattr(
@@ -175,12 +193,15 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
         self.set_current_item("階段一：比對記憶池與快取...", force=True)
         # 不要在翻譯開始前把全域記憶池命中逐筆寫入 shelve 快取。
         # 38k 詞彙、1w+ 記憶池命中會變成大量磁碟隨機寫入，導致第一階段長時間卡住。
-        # 輸出時 get_translation() 已會讀取記憶池，所以這裡只做集合比對。
+        # 以批次快取快照和記憶池值判斷有效命中，避免無效舊值跳過翻譯。
         # force 模式仍使用記憶池和快取作為 fallback：翻譯引擎未翻到的字串，
         # 輸出時會從快取/記憶池取回，避免產生未翻譯的輸出。
-        cache_keys = set() if force_mode else set(self.translation_cache.keys())
+        cache_keys = set() if force_mode else usable_cache_translation_keys(self, unique_strings)
         memory = self._load_translation_memory() if self.global_memory_var.get() else {}
-        memory_keys = set(memory.keys()) if memory else set()
+        memory_keys = {
+            source for source in unique_strings
+            if source in memory and _translation_value_is_usable(self, source, memory[source])
+        } if memory else set()
         if force_mode:
             cache_hit_strings = set()
             memory_hit_strings = set()
@@ -830,10 +851,13 @@ def run_translate_task(self, rp_dir, rp_name, pack_format, output_mode="jar_patc
         self._note_progress_error()
         self._set_summary_card("api", "錯誤", "請查看執行記錄", self.C_DANGER)
     finally:
+        self._last_translation_succeeded = bool(
+            task_completed and not task_error and not task_cancelled
+            and not self.stop_requested and not self.pause_requested)
         elapsed = time.time() - task_started_at
         elapsed_text = self._format_eta(elapsed) if hasattr(self, "_format_eta") else f"{elapsed:.1f}s"
         total_strings = getattr(self, "_analysis_total_strings", 0)
-        if task_completed:
+        if self._last_translation_succeeded:
             self.log(f"✅ 任務完成，用時 {elapsed_text}")
             if output_path:
                 self.log(f"✅ 輸出完成：{output_path}")

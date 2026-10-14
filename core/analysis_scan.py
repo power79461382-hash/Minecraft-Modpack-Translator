@@ -1417,8 +1417,10 @@ def scan_single_jar(self, path):
 
 
 def run_analyze_task(self, mod_dir):
+    self._last_analysis_succeeded = False
     try:
         self._analyze_task_impl(mod_dir)
+        self._last_analysis_succeeded = not self.stop_requested
     except Exception as e:
         details = traceback.format_exc()
         try:

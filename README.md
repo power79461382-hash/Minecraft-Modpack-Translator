@@ -1,5 +1,14 @@
 # Minecraft Modpack Translator
 
+## 2026-10-14 相容性與可靠性修正
+
+- Xiaomi MiMo 更新為 `mimo-v2.6-pro` / `mimo-v2.6-flash`，讀取舊設定及送出請求時依原本等級遷移。保留自訂端點，明確設定 `max_completion_tokens=4096` 與關閉思考模式。[官方下線公告](https://mimo.mi.com/docs/zh-CN/updates/deprecate)指出舊 ID 於 10/14 18:00（UTC+8）自動轉新版，10/21 10:00 起失效。
+- Windows API Key 使用系統內建 DPAPI，不再因缺少額外套件而悄悄降為 Base64。設定採完整寫入後替換；舊 Base64 設定仍可讀取。
+- 舊 pickle / shelve 快取及記憶池僅接受資料物件；SQLite 寫入失敗保留既有內容與待存進度。
+- 修正無效快取遮住記憶池、備援回應筆數／型別、額外格式碼、取消時 JSON／Markdown 截斷、SNBT 技術欄位及 Markdown 程式碼／YAML 引號保留問題。
+- CLI 正確回報失敗／取消，檔案範圍與數量限制同步套用翻譯清單，API Key／模型／本機端點參數對應選用引擎。
+- 新增 Windows / Linux 回歸測試與 Windows 封裝 CI。測試以人工資料及 mock 驗證，不使用真實金鑰或付費翻譯。
+
 Minecraft Modpack Translator 是一個面向 Minecraft 大型整合包的 Windows 翻譯工具。它會掃描 Forge、NeoForge、Fabric 整合包中的模組 JAR、語言檔、任務檔、手冊、書本與部分資料檔，將可安全覆蓋的玩家可見文字轉成繁體中文 `zh_tw`。
 
 本專案的目標不是只翻譯單一 `en_us.json`，而是盡可能處理整合包常見的多來源文字：模組語言檔、Patchouli 手冊、FTB Quests / KubeJS 任務、advancement、OpenLoader / Paxi 覆蓋資料、Origins JSON、Alex's Mobs 類型書本、Markdown / SNBT / 部分設定文字，以及低風險硬編碼 tooltip。

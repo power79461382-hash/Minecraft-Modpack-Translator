@@ -1,10 +1,12 @@
 import json
 import contextlib
+import dbm
+import io
 import os
 import pickle
+import pickletools
 import re
 import shutil
-import shelve
 import sqlite3
 import threading
 import time
@@ -108,10 +110,13 @@ class TranslationCacheStore(MutableMapping):
         if not self._pending:
             return 0
         pending = list(self._pending.items())
-        self._db.executemany(
-            "INSERT OR REPLACE INTO cache(source, translated) VALUES (?, ?)",
-            pending,
-        )
+        # Keep the in-memory checkpoint until COMMIT succeeds. A failed write
+        # must roll back partial inserts and remain retryable.
+        with self._db:
+            self._db.executemany(
+                "INSERT OR REPLACE INTO cache(source, translated) VALUES (?, ?)",
+                pending,
+            )
         self._pending.clear()
         self._pending_new_count = 0
         return len(pending)
@@ -378,10 +383,28 @@ class TranslationCacheStore(MutableMapping):
             return written
 
 
+class _LegacyCacheUnpickler(pickle.Unpickler):
+    """Legacy caches contain plain strings/dicts, never imported callables."""
+
+    def find_class(self, module, name):
+        raise pickle.UnpicklingError("legacy cache contains an unsupported object")
+
+
+def load_legacy_cache_pickle(stream):
+    """Read a legacy plain-data pickle without importing stored objects."""
+    payload = stream.read()
+    # Cached extension objects bypass find_class, so reject those opcodes before
+    # unpickling. Plain string/dict caches never need registered extensions.
+    for opcode, _argument, _position in pickletools.genops(payload):
+        if opcode.name in {"EXT1", "EXT2", "EXT4"}:
+            raise pickle.UnpicklingError("legacy cache contains an unsupported extension")
+    return _LegacyCacheUnpickler(io.BytesIO(payload)).load()
+
+
 def _read_legacy_cache(candidate: str) -> Dict[str, str]:
     if candidate.endswith(".pkl") or candidate.endswith(".pkl.bak"):
         with open(candidate, "rb") as f:
-            raw = pickle.load(f)
+            raw = load_legacy_cache_pickle(f)
     else:
         with open(candidate, "r", encoding="utf-8") as f:
             raw = json.load(f)
@@ -420,9 +443,11 @@ def _sqlite_has_files(cache_file: str) -> bool:
 def _read_shelve_cache(cache_file: str) -> Dict[str, str]:
     base = cache_file + ".shelve"
     raw: Dict[str, str] = {}
-    with shelve.open(base, flag="r") as old:
-        for key in old.keys():
-            value = old[key]
+    # Read dbm values directly: shelve.__getitem__ uses unrestricted pickle.
+    with dbm.open(base, flag="r") as old:
+        for encoded_key in old.keys():
+            key = encoded_key.decode("utf-8")
+            value = load_legacy_cache_pickle(io.BytesIO(old[encoded_key]))
             if isinstance(key, str) and isinstance(value, str):
                 raw[key] = value
     return raw
@@ -543,12 +568,25 @@ def save_translation_cache(cache_file: str, cache: Mapping[str, str]) -> float:
         return time.time()
 
     snapshot = sanitize_value(dict(cache))
-    store, _messages = load_translation_cache(
+    # Saving must report open/write failure instead of returning an apparent
+    # success from load_translation_cache's in-memory recovery path.
+    store = TranslationCacheStore(
         cache_file, re.compile(r"$^"), lambda _s, _t: True)
-    if isinstance(store, TranslationCacheStore):
-        store.clear()
-        store.bulk_update(snapshot.items())
-        store.sync()
+    try:
+        pairs = [
+            (sanitize_text(str(key)), sanitize_text(fix_placeholders(str(value))))
+            for key, value in snapshot.items()
+        ]
+        # DELETE and replacement rows form one transaction; prior data survives
+        # if an insert or the final COMMIT fails.
+        with store._lock, store._db:
+            store._db.execute("DELETE FROM cache")
+            store._db.executemany(
+                "INSERT OR REPLACE INTO cache(source, translated) VALUES (?, ?)",
+                pairs,
+            )
+    finally:
+        store.close()
     return time.time()
 
 

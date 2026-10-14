@@ -115,6 +115,8 @@ def class_utf8_entries(data):
                 offset += 3
             else:
                 return []
+            if offset > len(data):
+                return []
             index += 1
         return entries
     except (IndexError, ValueError):
