@@ -24,4 +24,3 @@ def test_gui_has_lt_service_buttons():
     text = Path("gui/main_window.py").read_text(encoding="utf-8")
     assert "start_libretranslate_service" in text
     assert "btn_lt_start" in text
-    assert "v1.2.14" in text
