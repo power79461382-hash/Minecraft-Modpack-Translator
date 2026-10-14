@@ -1163,7 +1163,7 @@ class ModTranslatorApp:
                       font=("微軟正黑體", 15),
                       relief="flat", bd=0, cursor="hand2",
                       width=3).pack(side=tk.LEFT, padx=(0, 10))
-        tk.Label(sidebar, text="v1.2.14", bg=panel2, fg=muted,
+        tk.Label(sidebar, text="v1.2.15", bg=panel2, fg=muted,
                  font=("Consolas", 9), anchor="w").pack(
                      side=tk.BOTTOM, fill=tk.X, padx=22, pady=(0, 10))
 
@@ -2399,7 +2399,7 @@ class ModTranslatorApp:
     def show_about(self):
         msg = (
             "Minecraft 模組翻譯器\n"
-            "版本：v1.2.14\n"
+            "版本：v1.2.15\n"
             "預設模型：DeepSeek V4 Flash Free (OpenRouter)\n"
             "支援：JAR 直接翻譯、自動判定、全域記憶池與多 API 模型"
         )
