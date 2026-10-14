@@ -1,6 +1,6 @@
 # Minecraft Modpack Translator
 
-## 2026-10-14 相容性與可靠性修正
+## v1.2.15（2026-10-14）相容性與可靠性修正
 
 - Xiaomi MiMo 更新為 `mimo-v2.6-pro` / `mimo-v2.6-flash`，讀取舊設定及送出請求時依原本等級遷移。保留自訂端點，明確設定 `max_completion_tokens=4096` 與關閉思考模式。[官方下線公告](https://mimo.mi.com/docs/zh-CN/updates/deprecate)指出舊 ID 於 10/14 18:00（UTC+8）自動轉新版，10/21 10:00 起失效。
 - Windows API Key 使用系統內建 DPAPI，不再因缺少額外套件而悄悄降為 Base64。設定採完整寫入後替換；舊 Base64 設定仍可讀取。
@@ -30,9 +30,9 @@ Minecraft Modpack Translator 是一個面向 Minecraft 大型整合包的 Window
 
 一般使用者不需要安裝 Python。請到 GitHub Releases 下載最新版：
 
-- 目前最新版：**v1.2.14**（2026-09-10）
+- 目前最新版：**v1.2.15**（2026-10-14）
 - 下載頁：[Releases / 最新版](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/latest)
-- 直接下載：[MinecraftTranslatorGUI.exe（v1.2.6）](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/download/v1.2.14/MinecraftTranslatorGUI.exe)
+- 直接下載：[MinecraftTranslatorGUI.exe（v1.2.15）](https://github.com/power79461382-hash/Minecraft-Modpack-Translator/releases/download/v1.2.15/MinecraftTranslatorGUI.exe)
 - 檔案名稱：`MinecraftTranslatorGUI.exe`
 - 系統需求：Windows 10/11，建議放在可寫入的資料夾中執行
 - 使用方式：下載後直接雙擊啟動，選擇整合包資料夾，按「分析檔案」後再開始翻譯
